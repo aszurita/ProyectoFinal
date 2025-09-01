@@ -8,14 +8,16 @@
 #include <signal.h>
 #include <ncurses.h>
 #include <sys/types.h>
+#include <time.h>
 
 #define MAX_BANDAS 10
-#define MAX_INGREDIENTES 20
+#define MAX_INGREDIENTES 15
 #define MAX_ORDENES 100
 #define MAX_NOMBRE_INGREDIENTE 50
 #define CAPACIDAD_DISPENSADOR 20
+#define NUM_TIPOS_HAMBURGUESA 6
 
-// Mismas estructuras que el sistema principal
+// Estructura para ingredientes por banda
 typedef struct
 {
     char nombre[MAX_NOMBRE_INGREDIENTE];
@@ -23,14 +25,28 @@ typedef struct
     pthread_mutex_t mutex;
 } Ingrediente;
 
+// Definición de tipos de hamburguesas (igual que en el sistema principal)
+typedef struct
+{
+    char nombre[50];
+    char ingredientes[10][MAX_NOMBRE_INGREDIENTE];
+    int num_ingredientes;
+    float precio;
+} TipoHamburguesa;
+
+// Estructura para una orden específica
 typedef struct
 {
     int id_orden;
+    int tipo_hamburguesa;
+    char nombre_hamburguesa[50];
     char ingredientes_solicitados[MAX_INGREDIENTES][MAX_NOMBRE_INGREDIENTE];
     int num_ingredientes;
     time_t tiempo_creacion;
+    int paso_actual;
 } Orden;
 
+// Estructura para una banda de preparación
 typedef struct
 {
     int id;
@@ -39,11 +55,14 @@ typedef struct
     int hamburguesas_procesadas;
     int procesando_orden;
     Orden orden_actual;
+    Ingrediente dispensadores[MAX_INGREDIENTES];
     pthread_t hilo;
     pthread_mutex_t mutex;
     pthread_cond_t condicion;
+    char estado_actual[100];
 } Banda;
 
+// Cola FIFO para órdenes en espera
 typedef struct
 {
     Orden ordenes[MAX_ORDENES];
@@ -55,13 +74,12 @@ typedef struct
     pthread_cond_t no_llena;
 } ColaFIFO;
 
+// Estructura de datos compartidos
 typedef struct
 {
     Banda bandas[MAX_BANDAS];
-    Ingrediente ingredientes[MAX_INGREDIENTES];
     ColaFIFO cola_espera;
     int num_bandas;
-    int num_ingredientes;
     int sistema_activo;
     int total_ordenes_procesadas;
     pthread_mutex_t mutex_global;
@@ -70,22 +88,33 @@ typedef struct
 
 // Variables globales
 DatosCompartidos *datos_compartidos;
-WINDOW *win_control;
-WINDOW *win_estado;
+WINDOW *win_bandas;
+WINDOW *win_inventario;
 WINDOW *win_comandos;
-int pid_sistema = -1;
+WINDOW *win_menu;
+int banda_seleccionada = 0;
+
+// Menú de hamburguesas (igual que en el sistema principal)
+TipoHamburguesa menu_hamburguesas[NUM_TIPOS_HAMBURGUESA] = {
+    {"Clásica", {"pan_inferior", "carne", "lechuga", "tomate", "pan_superior"}, 5, 8.50},
+    {"Cheeseburger", {"pan_inferior", "carne", "queso", "lechuga", "tomate", "pan_superior"}, 6, 9.25},
+    {"BBQ Bacon", {"pan_inferior", "carne", "bacon", "queso", "cebolla", "salsa_bbq", "pan_superior"}, 7, 11.75},
+    {"Vegetariana", {"pan_inferior", "hamburguesa_vegetal", "lechuga", "tomate", "aguacate", "mayonesa", "pan_superior"}, 7, 10.25},
+    {"Deluxe", {"pan_inferior", "carne", "queso", "bacon", "lechuga", "tomate", "cebolla", "mayonesa", "pan_superior"}, 9, 13.50},
+    {"Spicy Mexican", {"pan_inferior", "carne", "queso", "jalapeños", "tomate", "cebolla", "salsa_picante", "pan_superior"}, 8, 12.00}};
 
 // Prototipos
 void inicializar_ncurses();
 void conectar_memoria_compartida();
-void mostrar_interfaz_control_avanzada();
+void mostrar_interfaz_completa();
 void procesar_comando(int ch);
 void pausar_banda(int banda_id);
 void reanudar_banda(int banda_id);
 void reanudar_todas_bandas();
-void reabastecer_ingrediente(int ingrediente_id);
-void reabastecer_todos_ingredientes();
-void encontrar_pid_sistema();
+void reabastecer_banda_especifica(int banda_id);
+void reabastecer_ingrediente_banda(int banda_id, int ingrediente_id);
+void mostrar_menu_hamburguesas_panel();
+void cambiar_banda_seleccionada(int direccion);
 void limpiar_ncurses();
 void mostrar_ayuda_control();
 
@@ -102,29 +131,34 @@ void inicializar_ncurses()
     if (has_colors())
     {
         start_color();
-        init_pair(1, COLOR_GREEN, COLOR_BLACK);  // Verde para estado activo
-        init_pair(2, COLOR_YELLOW, COLOR_BLACK); // Amarillo para pausado
-        init_pair(3, COLOR_RED, COLOR_BLACK);    // Rojo para alertas
-        init_pair(4, COLOR_CYAN, COLOR_BLACK);   // Cian para encabezados
-        init_pair(5, COLOR_WHITE, COLOR_BLUE);   // Blanco sobre azul para selección
+        init_pair(1, COLOR_GREEN, COLOR_BLACK);   // Verde para estado activo
+        init_pair(2, COLOR_YELLOW, COLOR_BLACK);  // Amarillo para pausado
+        init_pair(3, COLOR_RED, COLOR_BLACK);     // Rojo para alertas
+        init_pair(4, COLOR_CYAN, COLOR_BLACK);    // Cian para encabezados
+        init_pair(5, COLOR_WHITE, COLOR_BLUE);    // Blanco sobre azul para selección
+        init_pair(6, COLOR_MAGENTA, COLOR_BLACK); // Magenta para bandas seleccionadas
     }
 
     // Crear ventanas
     int altura_terminal, ancho_terminal;
     getmaxyx(stdscr, altura_terminal, ancho_terminal);
 
-    // Ventana de control (izquierda)
-    win_control = newwin(altura_terminal - 5, ancho_terminal / 2, 0, 0);
+    // Ventana de bandas (superior izquierda)
+    win_bandas = newwin(altura_terminal / 2, ancho_terminal / 2, 0, 0);
 
-    // Ventana de estado (derecha)
-    win_estado = newwin(altura_terminal - 5, ancho_terminal / 2, 0, ancho_terminal / 2);
+    // Ventana de inventario (superior derecha)
+    win_inventario = newwin(altura_terminal / 2, ancho_terminal / 2, 0, ancho_terminal / 2);
 
-    // Ventana de comandos (abajo)
-    win_comandos = newwin(5, ancho_terminal, altura_terminal - 5, 0);
+    // Ventana de menú (inferior izquierda)
+    win_menu = newwin(altura_terminal / 2, ancho_terminal / 2, altura_terminal / 2, 0);
+
+    // Ventana de comandos (inferior derecha)
+    win_comandos = newwin(altura_terminal / 2, ancho_terminal / 2, altura_terminal / 2, ancho_terminal / 2);
 
     // Habilitar teclas especiales para todas las ventanas
-    keypad(win_control, TRUE);
-    keypad(win_estado, TRUE);
+    keypad(win_bandas, TRUE);
+    keypad(win_inventario, TRUE);
+    keypad(win_menu, TRUE);
     keypad(win_comandos, TRUE);
 
     refresh();
@@ -153,90 +187,111 @@ void conectar_memoria_compartida()
     close(shm_fd);
 }
 
-void mostrar_interfaz_control_avanzada()
+void mostrar_interfaz_completa()
 {
-    // Limpiar ventanas
-    werase(win_control);
-    werase(win_estado);
+    // Limpiar todas las ventanas
+    werase(win_bandas);
+    werase(win_inventario);
+    werase(win_menu);
     werase(win_comandos);
 
-    // Ventana de control de bandas
+    // ═══ VENTANA DE BANDAS ═══
     if (has_colors())
-        wattron(win_control, COLOR_PAIR(4));
-    wborder(win_control, '|', '|', '-', '-', '+', '+', '+', '+');
-    mvwprintw(win_control, 0, 2, " CONTROL DE BANDAS ");
+        wattron(win_bandas, COLOR_PAIR(4));
+    wborder(win_bandas, '|', '|', '-', '-', '+', '+', '+', '+');
+    mvwprintw(win_bandas, 0, 2, " ESTADO DE BANDAS ");
     if (has_colors())
-        wattroff(win_control, COLOR_PAIR(4));
+        wattroff(win_bandas, COLOR_PAIR(4));
 
-    for (int i = 0; i < datos_compartidos->num_bandas; i++)
+    mvwprintw(win_bandas, 1, 2, "Total procesadas: %d | En cola: %d",
+              datos_compartidos->total_ordenes_procesadas,
+              datos_compartidos->cola_espera.tamano);
+
+    for (int i = 0; i < datos_compartidos->num_bandas && i < 8; i++)
     {
         Banda *banda = &datos_compartidos->bandas[i];
 
-        int color_pair = 1; // Verde por defecto (activa)
-        char estado[20];
-
+        int color_pair = 1; // Verde por defecto
         if (!banda->activa)
-        {
-            strcpy(estado, "INACTIVA");
             color_pair = 3; // Rojo
-        }
         else if (banda->pausada)
-        {
-            strcpy(estado, "PAUSADA");
             color_pair = 2; // Amarillo
-        }
-        else if (banda->procesando_orden)
+        else if (i == banda_seleccionada)
+            color_pair = 6; // Magenta para seleccionada
+
+        if (has_colors())
+            wattron(win_bandas, COLOR_PAIR(color_pair));
+
+        mvwprintw(win_bandas, 3 + i * 2, 2, "BANDA %d: %s", i,
+                  banda->pausada ? "PAUSADA" : (!banda->activa ? "INACTIVA" : "ACTIVA"));
+
+        // Mostrar estado actual con truncamiento si es muy largo
+        char estado_corto[30];
+        strncpy(estado_corto, banda->estado_actual, 29);
+        estado_corto[29] = '\0';
+        mvwprintw(win_bandas, 4 + i * 2, 2, "  Estado: %-25s Procesadas: %d",
+                  estado_corto, banda->hamburguesas_procesadas);
+
+        if (has_colors())
+            wattroff(win_bandas, COLOR_PAIR(color_pair));
+    }
+
+    // ═══ VENTANA DE INVENTARIO (BANDA SELECCIONADA) ═══
+    if (has_colors())
+        wattron(win_inventario, COLOR_PAIR(4));
+    wborder(win_inventario, '|', '|', '-', '-', '+', '+', '+', '+');
+    mvwprintw(win_inventario, 0, 2, " INVENTARIO BANDA %d ", banda_seleccionada);
+    if (has_colors())
+        wattroff(win_inventario, COLOR_PAIR(4));
+
+    if (banda_seleccionada < datos_compartidos->num_bandas)
+    {
+        Banda *banda = &datos_compartidos->bandas[banda_seleccionada];
+
+        // Mostrar si está procesando una orden
+        if (banda->procesando_orden)
         {
-            strcpy(estado, "PROCESANDO");
-            color_pair = 1; // Verde
+            mvwprintw(win_inventario, 2, 2, "Procesando: %s (Orden #%d)",
+                      banda->orden_actual.nombre_hamburguesa,
+                      banda->orden_actual.id_orden);
+            mvwprintw(win_inventario, 3, 2, "Progreso: %d/%d ingredientes",
+                      banda->orden_actual.paso_actual,
+                      banda->orden_actual.num_ingredientes);
         }
         else
         {
-            strcpy(estado, "ESPERANDO");
-            color_pair = 1; // Verde
+            mvwprintw(win_inventario, 2, 2, "Estado: %s", banda->estado_actual);
         }
 
-        if (has_colors())
-            wattron(win_control, COLOR_PAIR(color_pair));
-        mvwprintw(win_control, 2 + i * 2, 2, "Banda %d: %-12s", i, estado);
-        mvwprintw(win_control, 3 + i * 2, 2, "  Procesadas: %-6d [%c] Pausar [%c] Reanudar",
-                  banda->hamburguesas_procesadas, '1' + i, 'A' + i);
-        if (has_colors())
-            wattroff(win_control, COLOR_PAIR(color_pair));
+        // Mostrar dispensadores
+        mvwprintw(win_inventario, 5, 2, "DISPENSADORES:");
+        for (int j = 0; j < 10 && j < MAX_INGREDIENTES; j++)
+        {
+            pthread_mutex_lock(&banda->dispensadores[j].mutex);
+            int cantidad = banda->dispensadores[j].cantidad;
+            char *nombre = banda->dispensadores[j].nombre;
+
+            int color_pair = 1; // Verde
+            if (cantidad <= 2)
+                color_pair = 2; // Amarillo
+            if (cantidad == 0)
+                color_pair = 3; // Rojo
+
+            if (has_colors())
+                wattron(win_inventario, COLOR_PAIR(color_pair));
+            mvwprintw(win_inventario, 6 + j, 2, "%-15s: %2d [%c]",
+                      nombre, cantidad, 'a' + j);
+            if (has_colors())
+                wattroff(win_inventario, COLOR_PAIR(color_pair));
+
+            pthread_mutex_unlock(&banda->dispensadores[j].mutex);
+        }
     }
 
-    // Ventana de estado del sistema
-    if (has_colors())
-        wattron(win_estado, COLOR_PAIR(4));
-    wborder(win_estado, '|', '|', '-', '-', '+', '+', '+', '+');
-    mvwprintw(win_estado, 0, 2, " ESTADO DEL SISTEMA ");
-    if (has_colors())
-        wattroff(win_estado, COLOR_PAIR(4));
+    // ═══ VENTANA DE MENÚ ═══
+    mostrar_menu_hamburguesas_panel();
 
-    mvwprintw(win_estado, 2, 2, "Total procesadas: %d", datos_compartidos->total_ordenes_procesadas);
-    mvwprintw(win_estado, 3, 2, "En cola de espera: %d", datos_compartidos->cola_espera.tamano);
-
-    mvwprintw(win_estado, 5, 2, "INVENTARIO:");
-    for (int i = 0; i < datos_compartidos->num_ingredientes && i < 15; i++)
-    {
-        int cantidad = datos_compartidos->ingredientes[i].cantidad;
-        char *nombre = datos_compartidos->ingredientes[i].nombre;
-
-        int color_pair = 1; // Verde
-        if (cantidad <= 2)
-            color_pair = 2; // Amarillo
-        if (cantidad == 0)
-            color_pair = 3; // Rojo
-
-        if (has_colors())
-            wattron(win_estado, COLOR_PAIR(color_pair));
-        mvwprintw(win_estado, 6 + i, 2, "%-15s: %2d [%c]",
-                  nombre, cantidad, 'a' + i);
-        if (has_colors())
-            wattroff(win_estado, COLOR_PAIR(color_pair));
-    }
-
-    // Ventana de comandos
+    // ═══ VENTANA DE COMANDOS ═══
     if (has_colors())
         wattron(win_comandos, COLOR_PAIR(5));
     wborder(win_comandos, '|', '|', '-', '-', '+', '+', '+', '+');
@@ -244,15 +299,58 @@ void mostrar_interfaz_control_avanzada()
     if (has_colors())
         wattroff(win_comandos, COLOR_PAIR(5));
 
-    mvwprintw(win_comandos, 1, 2, "Bandas: [1-9] Pausar | [A-I] Reanudar | [R] Reanudar todas");
-    mvwprintw(win_comandos, 2, 2, "Inventario: [a-o] Reabastecer ingrediente | [T] Todos | [S] Estado");
-    mvwprintw(win_comandos, 3, 2, "Sistema: [H] Ayuda | [Q] Salir | [ENTER] Actualizar");
+    mvwprintw(win_comandos, 2, 2, "NAVEGACIÓN:");
+    mvwprintw(win_comandos, 3, 2, "  ↑/↓: Cambiar banda seleccionada");
+    mvwprintw(win_comandos, 4, 2, "  ESPACIO: Pausar/Reanudar banda");
+
+    mvwprintw(win_comandos, 6, 2, "CONTROL BANDAS:");
+    mvwprintw(win_comandos, 7, 2, "  1-9: Pausar banda específica");
+    mvwprintw(win_comandos, 8, 2, "  R: Reanudar todas las bandas");
+
+    mvwprintw(win_comandos, 10, 2, "INVENTARIO:");
+    mvwprintw(win_comandos, 11, 2, "  a-j: Reabastecer ingrediente");
+    mvwprintw(win_comandos, 12, 2, "  T: Reabastecer banda completa");
+
+    mvwprintw(win_comandos, 14, 2, "SISTEMA:");
+    mvwprintw(win_comandos, 15, 2, "  H: Ayuda | Q: Salir");
 
     // Refrescar todas las ventanas
-    wrefresh(win_control);
-    wrefresh(win_estado);
+    wrefresh(win_bandas);
+    wrefresh(win_inventario);
+    wrefresh(win_menu);
     wrefresh(win_comandos);
     refresh();
+}
+
+void mostrar_menu_hamburguesas_panel()
+{
+    if (has_colors())
+        wattron(win_menu, COLOR_PAIR(4));
+    wborder(win_menu, '|', '|', '-', '-', '+', '+', '+', '+');
+    mvwprintw(win_menu, 0, 2, " MENÚ DE HAMBURGUESAS ");
+    if (has_colors())
+        wattroff(win_menu, COLOR_PAIR(4));
+
+    for (int i = 0; i < NUM_TIPOS_HAMBURGUESA; i++)
+    {
+        mvwprintw(win_menu, 2 + i * 2, 2, "%d. %-15s $%.2f",
+                  i + 1, menu_hamburguesas[i].nombre, menu_hamburguesas[i].precio);
+
+        // Mostrar algunos ingredientes principales
+        char ingredientes_cortos[60] = "";
+        for (int j = 0; j < 3 && j < menu_hamburguesas[i].num_ingredientes; j++)
+        {
+            if (j > 0)
+                strcat(ingredientes_cortos, ", ");
+            strncat(ingredientes_cortos, menu_hamburguesas[i].ingredientes[j], 10);
+        }
+        if (menu_hamburguesas[i].num_ingredientes > 3)
+        {
+            strcat(ingredientes_cortos, "...");
+        }
+
+        mvwprintw(win_menu, 3 + i * 2, 2, "   %s", ingredientes_cortos);
+    }
 }
 
 void procesar_comando(int ch)
@@ -261,12 +359,30 @@ void procesar_comando(int ch)
     {
     case 'q':
     case 'Q':
-        // Salir del panel de control
         return;
 
     case 'h':
     case 'H':
         mostrar_ayuda_control();
+        break;
+
+    case KEY_UP:
+        cambiar_banda_seleccionada(-1);
+        break;
+
+    case KEY_DOWN:
+        cambiar_banda_seleccionada(1);
+        break;
+
+    case ' ': // ESPACIO - pausar/reanudar banda seleccionada
+        if (datos_compartidos->bandas[banda_seleccionada].pausada)
+        {
+            reanudar_banda(banda_seleccionada);
+        }
+        else
+        {
+            pausar_banda(banda_seleccionada);
+        }
         break;
 
     case 'r':
@@ -276,12 +392,7 @@ void procesar_comando(int ch)
 
     case 't':
     case 'T':
-        reabastecer_todos_ingredientes();
-        break;
-
-    case 's':
-    case 'S':
-        // Forzar actualización de estado
+        reabastecer_banda_especifica(banda_seleccionada);
         break;
 
     case '1':
@@ -296,17 +407,6 @@ void procesar_comando(int ch)
         pausar_banda(ch - '1');
         break;
 
-    case 'A':
-    case 'B':
-    case 'C':
-    case 'D':
-    case 'E':
-    case 'F':
-    case 'G':
-    case 'I':
-        reanudar_banda(ch - 'A');
-        break;
-
     case 'a':
     case 'b':
     case 'c':
@@ -316,13 +416,21 @@ void procesar_comando(int ch)
     case 'g':
     case 'i':
     case 'j':
-    case 'k':
-    case 'l':
-    case 'm':
-    case 'n':
-    case 'o':
-        reabastecer_ingrediente(ch - 'a');
+        reabastecer_ingrediente_banda(banda_seleccionada, ch - 'a');
         break;
+    }
+}
+
+void cambiar_banda_seleccionada(int direccion)
+{
+    banda_seleccionada += direccion;
+    if (banda_seleccionada < 0)
+    {
+        banda_seleccionada = datos_compartidos->num_bandas - 1;
+    }
+    if (banda_seleccionada >= datos_compartidos->num_bandas)
+    {
+        banda_seleccionada = 0;
     }
 }
 
@@ -332,9 +440,11 @@ void pausar_banda(int banda_id)
     {
         datos_compartidos->bandas[banda_id].pausada = 1;
 
-        // Mostrar mensaje de confirmación
-        mvwprintw(win_comandos, 4, 2, "Banda %d PAUSADA                    ", banda_id);
-        wrefresh(win_comandos);
+        // Mostrar mensaje temporal en la parte inferior
+        mvprintw(LINES - 1, 0, "Banda %d PAUSADA - Presiona cualquier tecla...", banda_id);
+        refresh();
+        getch();
+        mvprintw(LINES - 1, 0, "%*s", COLS, ""); // Limpiar línea
     }
 }
 
@@ -347,8 +457,10 @@ void reanudar_banda(int banda_id)
             datos_compartidos->bandas[banda_id].pausada = 0;
             pthread_cond_signal(&datos_compartidos->bandas[banda_id].condicion);
 
-            mvwprintw(win_comandos, 4, 2, "Banda %d REANUDADA                 ", banda_id);
-            wrefresh(win_comandos);
+            mvprintw(LINES - 1, 0, "Banda %d REANUDADA - Presiona cualquier tecla...", banda_id);
+            refresh();
+            getch();
+            mvprintw(LINES - 1, 0, "%*s", COLS, ""); // Limpiar línea
         }
     }
 }
@@ -366,88 +478,85 @@ void reanudar_todas_bandas()
         }
     }
 
-    mvwprintw(win_comandos, 4, 2, "%d bandas REANUDADAS               ", bandas_reanudadas);
-    wrefresh(win_comandos);
+    mvprintw(LINES - 1, 0, "%d bandas REANUDADAS - Presiona cualquier tecla...", bandas_reanudadas);
+    refresh();
+    getch();
+    mvprintw(LINES - 1, 0, "%*s", COLS, ""); // Limpiar línea
 }
 
-void reabastecer_ingrediente(int ingrediente_id)
+void reabastecer_banda_especifica(int banda_id)
 {
-    if (ingrediente_id >= 0 && ingrediente_id < datos_compartidos->num_ingredientes)
+    if (banda_id >= 0 && banda_id < datos_compartidos->num_bandas)
     {
-        pthread_mutex_lock(&datos_compartidos->ingredientes[ingrediente_id].mutex);
-        datos_compartidos->ingredientes[ingrediente_id].cantidad = CAPACIDAD_DISPENSADOR;
-        pthread_mutex_unlock(&datos_compartidos->ingredientes[ingrediente_id].mutex);
-
-        mvwprintw(win_comandos, 4, 2, "Ingrediente %s REABASTECIDO      ",
-                  datos_compartidos->ingredientes[ingrediente_id].nombre);
-        wrefresh(win_comandos);
-    }
-}
-
-void reabastecer_todos_ingredientes()
-{
-    for (int i = 0; i < datos_compartidos->num_ingredientes; i++)
-    {
-        pthread_mutex_lock(&datos_compartidos->ingredientes[i].mutex);
-        datos_compartidos->ingredientes[i].cantidad = CAPACIDAD_DISPENSADOR;
-        pthread_mutex_unlock(&datos_compartidos->ingredientes[i].mutex);
-    }
-
-    mvwprintw(win_comandos, 4, 2, "TODOS los ingredientes REABASTECIDOS");
-    wrefresh(win_comandos);
-}
-
-void encontrar_pid_sistema()
-{
-    FILE *fp = popen("pgrep burger_system", "r");
-    if (fp != NULL)
-    {
-        if (fscanf(fp, "%d", &pid_sistema) != 1)
+        for (int i = 0; i < MAX_INGREDIENTES; i++)
         {
-            pid_sistema = -1;
+            pthread_mutex_lock(&datos_compartidos->bandas[banda_id].dispensadores[i].mutex);
+            datos_compartidos->bandas[banda_id].dispensadores[i].cantidad = CAPACIDAD_DISPENSADOR;
+            pthread_mutex_unlock(&datos_compartidos->bandas[banda_id].dispensadores[i].mutex);
         }
-        pclose(fp);
+
+        mvprintw(LINES - 1, 0, "Banda %d REABASTECIDA completamente - Presiona cualquier tecla...", banda_id);
+        refresh();
+        getch();
+        mvprintw(LINES - 1, 0, "%*s", COLS, ""); // Limpiar línea
+    }
+}
+
+void reabastecer_ingrediente_banda(int banda_id, int ingrediente_id)
+{
+    if (banda_id >= 0 && banda_id < datos_compartidos->num_bandas &&
+        ingrediente_id >= 0 && ingrediente_id < MAX_INGREDIENTES)
+    {
+
+        pthread_mutex_lock(&datos_compartidos->bandas[banda_id].dispensadores[ingrediente_id].mutex);
+        datos_compartidos->bandas[banda_id].dispensadores[ingrediente_id].cantidad = CAPACIDAD_DISPENSADOR;
+        char *nombre = datos_compartidos->bandas[banda_id].dispensadores[ingrediente_id].nombre;
+        pthread_mutex_unlock(&datos_compartidos->bandas[banda_id].dispensadores[ingrediente_id].mutex);
+
+        mvprintw(LINES - 1, 0, "Banda %d: %s REABASTECIDO - Presiona cualquier tecla...",
+                 banda_id, nombre);
+        refresh();
+        getch();
+        mvprintw(LINES - 1, 0, "%*s", COLS, ""); // Limpiar línea
     }
 }
 
 void mostrar_ayuda_control()
 {
-    WINDOW *win_ayuda = newwin(20, 60, 5, 10);
-    if (has_colors())
-        wattron(win_ayuda, COLOR_PAIR(4));
-    wborder(win_ayuda, '|', '|', '-', '-', '+', '+', '+', '+');
-    mvwprintw(win_ayuda, 0, 2, " AYUDA DEL PANEL DE CONTROL ");
-    if (has_colors())
-        wattroff(win_ayuda, COLOR_PAIR(4));
+    clear();
+    mvprintw(2, 5, "╔════════════════════════════════════════════════════════════════╗");
+    mvprintw(3, 5, "║                    AYUDA DEL PANEL DE CONTROL                  ║");
+    mvprintw(4, 5, "╠════════════════════════════════════════════════════════════════╣");
+    mvprintw(5, 5, "║ NAVEGACIÓN:                                                    ║");
+    mvprintw(6, 5, "║   ↑/↓           Cambiar banda seleccionada                     ║");
+    mvprintw(7, 5, "║   ESPACIO       Pausar/Reanudar banda seleccionada            ║");
+    mvprintw(8, 5, "║                                                                ║");
+    mvprintw(9, 5, "║ CONTROL DE BANDAS:                                             ║");
+    mvprintw(10, 5, "║   1-9           Pausar banda específica                        ║");
+    mvprintw(11, 5, "║   R             Reanudar todas las bandas                      ║");
+    mvprintw(12, 5, "║                                                                ║");
+    mvprintw(13, 5, "║ CONTROL DE INVENTARIO:                                         ║");
+    mvprintw(14, 5, "║   a-j           Reabastecer ingrediente específico (banda sel.)║");
+    mvprintw(15, 5, "║   T             Reabastecer toda la banda seleccionada        ║");
+    mvprintw(16, 5, "║                                                                ║");
+    mvprintw(17, 5, "║ SISTEMA:                                                       ║");
+    mvprintw(18, 5, "║   H             Mostrar esta ayuda                             ║");
+    mvprintw(19, 5, "║   Q             Salir del panel de control                     ║");
+    mvprintw(20, 5, "╚════════════════════════════════════════════════════════════════╝");
+    mvprintw(22, 5, "Presione cualquier tecla para continuar...");
 
-    mvwprintw(win_ayuda, 2, 2, "CONTROL DE BANDAS:");
-    mvwprintw(win_ayuda, 3, 2, "  1-9: Pausar banda correspondiente");
-    mvwprintw(win_ayuda, 4, 2, "  A-I: Reanudar banda correspondiente");
-    mvwprintw(win_ayuda, 5, 2, "  R:   Reanudar todas las bandas");
-
-    mvwprintw(win_ayuda, 7, 2, "CONTROL DE INVENTARIO:");
-    mvwprintw(win_ayuda, 8, 2, "  a-o: Reabastecer ingrediente específico");
-    mvwprintw(win_ayuda, 9, 2, "  T:   Reabastecer todos los ingredientes");
-
-    mvwprintw(win_ayuda, 11, 2, "COMANDOS DEL SISTEMA:");
-    mvwprintw(win_ayuda, 12, 2, "  S:     Actualizar estado");
-    mvwprintw(win_ayuda, 13, 2, "  H:     Mostrar esta ayuda");
-    mvwprintw(win_ayuda, 14, 2, "  Q:     Salir del panel de control");
-    mvwprintw(win_ayuda, 15, 2, "  ENTER: Refrescar pantalla");
-
-    mvwprintw(win_ayuda, 17, 2, "Presione cualquier tecla para continuar...");
-
-    wrefresh(win_ayuda);
-    wgetch(win_ayuda);
-    delwin(win_ayuda);
+    refresh();
+    getch();
 }
 
 void limpiar_ncurses()
 {
-    if (win_control)
-        delwin(win_control);
-    if (win_estado)
-        delwin(win_estado);
+    if (win_bandas)
+        delwin(win_bandas);
+    if (win_inventario)
+        delwin(win_inventario);
+    if (win_menu)
+        delwin(win_menu);
     if (win_comandos)
         delwin(win_comandos);
     endwin();
@@ -455,19 +564,17 @@ void limpiar_ncurses()
 
 int main()
 {
-    printf("Iniciando Panel de Control del Sistema de Hamburguesas...\n");
+    printf("Iniciando Panel de Control Avanzado del Sistema de Hamburguesas...\n");
+    printf("Conectando con sistema principal...\n");
 
     // Conectar con el sistema principal
     conectar_memoria_compartida();
-
-    // Encontrar PID del sistema principal
-    encontrar_pid_sistema();
 
     // Inicializar interfaz
     inicializar_ncurses();
 
     printf("Panel de control conectado exitosamente\n");
-    printf("Cambiando a interfaz gráfica...\n");
+    printf("Cambiando a interfaz gráfica avanzada...\n");
     sleep(2);
 
     // Bucle principal
@@ -486,7 +593,7 @@ int main()
                 break; // Sistema principal terminado
             }
 
-            mostrar_interfaz_control_avanzada();
+            mostrar_interfaz_completa();
             ultimo_refresh = ahora;
         }
 
@@ -494,14 +601,6 @@ int main()
         if (ch != ERR)
         {
             procesar_comando(ch);
-
-            // Limpiar línea de estado después de 2 segundos
-            if (ch != 'h' && ch != 'H')
-            {
-                sleep(2);
-                mvwprintw(win_comandos, 4, 2, "                                        ");
-                wrefresh(win_comandos);
-            }
         }
 
         usleep(50000); // 50ms de espera
