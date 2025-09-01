@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 
 #define MAX_BANDAS 10
 #define MAX_INGREDIENTES 15
@@ -51,7 +52,7 @@ typedef struct
     time_t tiempo_creacion;
     int paso_actual;
     int completada;
-    int asignada_a_banda; // Nueva: para tracking
+    int asignada_a_banda;
 } Orden;
 
 // Estructura para una banda de preparación
@@ -100,7 +101,7 @@ typedef struct
 // Variables globales
 DatosCompartidos *datos_compartidos;
 pthread_t hilo_generador_ordenes;
-pthread_t hilo_asignador_ordenes; // Nuevo hilo para asignación inteligente
+pthread_t hilo_asignador_ordenes;
 
 // Menú de hamburguesas disponibles
 TipoHamburguesa menu_hamburguesas[NUM_TIPOS_HAMBURGUESA] = {
@@ -117,20 +118,141 @@ char ingredientes_base[MAX_INGREDIENTES][MAX_NOMBRE_INGREDIENTE] = {
     "lechuga", "cebolla", "bacon", "mayonesa", "jalapenos",
     "aguacate", "vegetal", "salsa_bbq", "salsa_picante", "pepinillos"};
 
+// ═══════════════════════════════════════════════════════════════
+// FUNCIONES AUXILIARES PARA ALINEACIÓN PERFECTA
+// ═══════════════════════════════════════════════════════════════
+
+// Buffer global para formateo de texto (thread-safe con múltiples buffers)
+static char format_buffers[8][50];
+static int current_buffer = 0;
+
+/**
+ * Función para formatear texto con ancho fijo
+ */
+char *formatear_texto_fijo(const char *texto, int ancho)
+{
+    current_buffer = (current_buffer + 1) % 8;
+    char *buffer = format_buffers[current_buffer];
+
+    memset(buffer, ' ', ancho);
+    buffer[ancho] = '\0';
+
+    if (texto == NULL || strlen(texto) == 0)
+    {
+        return buffer;
+    }
+
+    int len = strlen(texto);
+    if (len <= ancho)
+    {
+        memcpy(buffer, texto, len);
+    }
+    else
+    {
+        if (ancho >= 3)
+        {
+            memcpy(buffer, texto, ancho - 3);
+            memcpy(buffer + ancho - 3, "...", 3);
+        }
+        else
+        {
+            memset(buffer, '.', ancho);
+        }
+    }
+
+    return buffer;
+}
+
+/**
+ * Función para centrar texto
+ */
+char *centrar_texto(const char *texto, int ancho)
+{
+    current_buffer = (current_buffer + 1) % 8;
+    char *buffer = format_buffers[current_buffer];
+
+    memset(buffer, ' ', ancho);
+    buffer[ancho] = '\0';
+
+    if (texto == NULL)
+        return buffer;
+
+    int len = strlen(texto);
+    if (len >= ancho)
+    {
+        return formatear_texto_fijo(texto, ancho);
+    }
+
+    int inicio = (ancho - len) / 2;
+    memcpy(buffer + inicio, texto, len);
+
+    return buffer;
+}
+
+/**
+ * Función para imprimir línea horizontal
+ */
+void imprimir_linea_separacion(int num_columnas, int ancho_columna, int separacion,
+                               char izq, char centro, char der, char relleno)
+{
+    for (int col = 0; col < num_columnas; col++)
+    {
+        if (col == 0)
+        {
+            printf("%c", izq);
+        }
+
+        for (int i = 0; i < ancho_columna - 2; i++)
+        {
+            printf("%c", relleno);
+        }
+
+        if (col == num_columnas - 1)
+        {
+            printf("%c", der);
+        }
+        else
+        {
+            printf("+");
+            for (int i = 0; i < separacion; i++)
+                printf(" ");
+        }
+    }
+    printf("\n");
+}
+
+/**
+ * Función para imprimir fila de contenido
+ */
+void imprimir_fila_contenido(char contenidos[][50], int num_columnas, int ancho_columna, int separacion)
+{
+    for (int col = 0; col < num_columnas; col++)
+    {
+        printf("|%s|", formatear_texto_fijo(contenidos[col], ancho_columna - 2));
+        if (col < num_columnas - 1)
+        {
+            for (int i = 0; i < separacion; i++)
+                printf(" ");
+        }
+    }
+    printf("\n");
+}
+
 // Prototipos de funciones
 void inicializar_sistema(int num_bandas);
 void mostrar_menu_hamburguesas();
 void *banda_worker(void *arg);
 void *generador_ordenes(void *arg);
-void *asignador_ordenes(void *arg); // Nuevo
+void *asignador_ordenes(void *arg);
 void procesar_orden(int banda_id, Orden *orden);
 int verificar_ingredientes_banda(int banda_id, Orden *orden);
 void consumir_ingredientes_banda(int banda_id, Orden *orden);
-int encontrar_banda_disponible(Orden *orden); // Nuevo
+int encontrar_banda_disponible(Orden *orden);
 void agregar_log_banda(int banda_id, const char *mensaje);
 void encolar_orden(Orden *orden);
 Orden *desencolar_orden();
 void mostrar_estado_columnar();
+void mostrar_estado_adaptativo();
 void generar_orden_especifica(Orden *orden, int id);
 void reabastecer_banda(int banda_id);
 void limpiar_sistema();
@@ -214,16 +336,16 @@ void inicializar_sistema(int num_bandas)
 
 void mostrar_menu_hamburguesas()
 {
-    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║                    MENÚ DE HAMBURGUESAS                      ║\n");
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("\n+------------------------------------------------------------------+\n");
+    printf("|                    MENU DE HAMBURGUESAS                          |\n");
+    printf("+------------------------------------------------------------------+\n");
 
     for (int i = 0; i < NUM_TIPOS_HAMBURGUESA; i++)
     {
-        printf("║ %d. %-20s - $%.2f                        ║\n",
+        printf("| %d. %-20s - $%.2f                                    |\n",
                i + 1, menu_hamburguesas[i].nombre, menu_hamburguesas[i].precio);
     }
-    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    printf("+------------------------------------------------------------------+\n");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -347,7 +469,6 @@ void *generador_ordenes(void *arg)
     return NULL;
 }
 
-// NUEVO: Hilo asignador inteligente de órdenes
 void *asignador_ordenes(void *arg)
 {
     (void)arg;
@@ -380,7 +501,7 @@ void *asignador_ordenes(void *arg)
             {
                 // No hay bandas disponibles con recursos, re-encolar
                 encolar_orden(orden);
-                sleep(2); // Esperar un poco antes de intentar de nuevo
+                sleep(2);
             }
         }
         else
@@ -393,7 +514,6 @@ void *asignador_ordenes(void *arg)
     return NULL;
 }
 
-// NUEVO: Encuentra una banda disponible que tenga los recursos necesarios
 int encontrar_banda_disponible(Orden *orden)
 {
     // Buscar banda libre con recursos suficientes
@@ -407,11 +527,11 @@ int encontrar_banda_disponible(Orden *orden)
 
         if (banda_libre && verificar_ingredientes_banda(i, orden))
         {
-            return i; // Banda encontrada
+            return i;
         }
     }
 
-    return -1; // No se encontró banda disponible
+    return -1;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -551,261 +671,345 @@ Orden *desencolar_orden()
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FUNCIÓN DE DISPLAY COLUMNAR MEJORADO
+// FUNCIÓN DE DISPLAY COLUMNAR MEJORADO CON ALINEACIÓN PERFECTA
 // ═══════════════════════════════════════════════════════════════
 
 void mostrar_estado_columnar()
 {
-    system("clear");
+    printf("\033[2J\033[H"); // Limpiar pantalla y mover cursor al inicio
 
     // Encabezado general del sistema
-    printf("╔═══════════════════════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                              SISTEMA DE HAMBURGUESAS - ESTADO                                ║\n");
-    printf("║ Total órdenes procesadas: %-6d  |  Órdenes en cola: %-6d  |  Bandas activas: %-6d      ║\n",
+    printf("+---------------------------------------------------------------------------------------------------------------+\n");
+    printf("|                              SISTEMA DE HAMBURGUESAS - ESTADO                                                |\n");
+    printf("| Total ordenes procesadas: %-6d  |  Ordenes en cola: %-6d  |  Bandas activas: %-6d                          |\n",
            datos_compartidos->total_ordenes_procesadas, datos_compartidos->cola_espera.tamano, datos_compartidos->num_bandas);
-    printf("║ Nueva orden cada 30s | Ingrediente cada 5s | Asignación inteligente de bandas              ║\n");
-    printf("╚═══════════════════════════════════════════════════════════════════════════════════════════════╝\n\n");
+    printf("| Nueva orden cada 30s | Ingrediente cada 5s | Asignacion inteligente de bandas                              |\n");
+    printf("+---------------------------------------------------------------------------------------------------------------+\n\n");
 
-    // Mostrar bandas dinámicamente (máximo 3 por fila)
-    int bandas_por_fila = (datos_compartidos->num_bandas > 3) ? 3 : datos_compartidos->num_bandas;
-    int filas_bandas = (datos_compartidos->num_bandas + 2) / 3; // Redondear hacia arriba
+    // Constantes para layout perfecto
+    const int ANCHO_COLUMNA = 45;
+    const int SEPARACION = 2;
+    const int MAX_COLUMNAS = 3;
+
+    // Calcular distribución de bandas en filas
+    int filas_bandas = (datos_compartidos->num_bandas + MAX_COLUMNAS - 1) / MAX_COLUMNAS;
 
     for (int fila = 0; fila < filas_bandas; fila++)
     {
-        int banda_inicio = fila * 3;
-        int banda_fin = (banda_inicio + 3 > datos_compartidos->num_bandas) ? datos_compartidos->num_bandas : banda_inicio + 3;
+        int banda_inicio = fila * MAX_COLUMNAS;
+        int banda_fin = (banda_inicio + MAX_COLUMNAS > datos_compartidos->num_bandas) ? datos_compartidos->num_bandas : banda_inicio + MAX_COLUMNAS;
+        int num_columnas_fila = banda_fin - banda_inicio;
 
-        // Crear las columnas para esta fila de bandas
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
+        // BORDES SUPERIORES
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
+
+        // ENCABEZADOS DE BANDAS
+        char titulos[MAX_COLUMNAS][50];
+        for (int col = 0; col < num_columnas_fila; col++)
         {
-            printf("┌─────────────────────────────────┐");
-            if (banda < banda_fin - 1)
-                printf("  ");
+            sprintf(titulos[col], "BANDA %d", banda_inicio + col + 1);
+            strcpy(titulos[col], centrar_texto(titulos[col], ANCHO_COLUMNA - 2));
         }
-        printf("\n");
+        imprimir_fila_contenido(titulos, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
 
-        // Encabezados de bandas
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
+        // Separador después de títulos
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
+
+        // SECCIÓN: INVENTARIO
+        char subtitulo_inv[MAX_COLUMNAS][50];
+        for (int col = 0; col < num_columnas_fila; col++)
         {
-            printf("│           BANDA %-2d               │", banda + 1);
-            if (banda < banda_fin - 1)
-                printf("  ");
+            strcpy(subtitulo_inv[col], centrar_texto("INVENTARIO", ANCHO_COLUMNA - 2));
         }
-        printf("\n");
+        imprimir_fila_contenido(subtitulo_inv, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
 
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("├─────────────────────────────────┤");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
+        // Separador inventario
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
 
-        // SECCIÓN: Inventario
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("│         INVENTARIO              │");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
-
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("├─────────────────────────────────┤");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
-
-        // Mostrar inventario de cada banda (primeros 8 ingredientes)
+        // Mostrar inventario (8 líneas fijas)
         for (int ing = 0; ing < 8; ing++)
         {
-            for (int banda = banda_inicio; banda < banda_fin; banda++)
+            char lineas_inventario[MAX_COLUMNAS][50];
+
+            for (int col = 0; col < num_columnas_fila; col++)
             {
-                Banda *b = &datos_compartidos->bandas[banda];
-                pthread_mutex_lock(&b->dispensadores[ing].mutex);
+                int banda = banda_inicio + col;
+                if (banda < datos_compartidos->num_bandas && ing < MAX_INGREDIENTES)
+                {
+                    Banda *b = &datos_compartidos->bandas[banda];
+                    pthread_mutex_lock(&b->dispensadores[ing].mutex);
 
-                char nombre_corto[15];
-                strncpy(nombre_corto, b->dispensadores[ing].nombre, 14);
-                nombre_corto[14] = '\0';
+                    char nombre_corto[13];
+                    strncpy(nombre_corto, b->dispensadores[ing].nombre, 12);
+                    nombre_corto[12] = '\0';
 
-                int cantidad = b->dispensadores[ing].cantidad;
-                char alerta[8] = "";
-                if (cantidad <= 2)
-                    strcpy(alerta, " [BAJO]");
-                if (cantidad == 0)
-                    strcpy(alerta, " [VACIO]");
+                    int cantidad = b->dispensadores[ing].cantidad;
 
-                printf("│%-14s: %2d%s%*s│", nombre_corto, cantidad, alerta,
-                       12 - (int)strlen(alerta), "");
-                pthread_mutex_unlock(&b->dispensadores[ing].mutex);
+                    if (cantidad == 0)
+                    {
+                        sprintf(lineas_inventario[col], "%-12s: %2d [VACIO]", nombre_corto, cantidad);
+                    }
+                    else if (cantidad <= 2)
+                    {
+                        sprintf(lineas_inventario[col], "%-12s: %2d [BAJO]", nombre_corto, cantidad);
+                    }
+                    else
+                    {
+                        sprintf(lineas_inventario[col], "%-12s: %2d", nombre_corto, cantidad);
+                    }
 
-                if (banda < banda_fin - 1)
-                    printf("  ");
+                    pthread_mutex_unlock(&b->dispensadores[ing].mutex);
+                }
+                else
+                {
+                    strcpy(lineas_inventario[col], "");
+                }
             }
-            printf("\n");
+
+            imprimir_fila_contenido(lineas_inventario, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
         }
 
         // Separador para preparación
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("├─────────────────────────────────┤");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
 
-        // SECCIÓN: Preparación
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
+        // SECCIÓN: PREPARACIÓN
+        char subtitulo_prep[MAX_COLUMNAS][50];
+        for (int col = 0; col < num_columnas_fila; col++)
         {
-            printf("│         PREPARACIÓN             │");
-            if (banda < banda_fin - 1)
-                printf("  ");
+            strcpy(subtitulo_prep[col], centrar_texto("PREPARACION", ANCHO_COLUMNA - 2));
         }
-        printf("\n");
+        imprimir_fila_contenido(subtitulo_prep, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
 
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("├─────────────────────────────────┤");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
+        // Separador preparación
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
 
-        // Mostrar estado de preparación
+        // Mostrar estado de preparación (6 líneas fijas)
         for (int linea = 0; linea < 6; linea++)
         {
-            for (int banda = banda_inicio; banda < banda_fin; banda++)
+            char lineas_prep[MAX_COLUMNAS][50];
+
+            for (int col = 0; col < num_columnas_fila; col++)
             {
-                Banda *b = &datos_compartidos->bandas[banda];
-                pthread_mutex_lock(&b->mutex);
-
-                switch (linea)
+                int banda = banda_inicio + col;
+                if (banda < datos_compartidos->num_bandas)
                 {
-                case 0:
-                    if (b->procesando_orden)
-                    {
-                        printf("│Orden %-3d: %-16s│", b->orden_actual.id_orden,
-                               b->orden_actual.nombre_hamburguesa);
-                    }
-                    else
-                    {
-                        printf("│%-31s│", "Sin orden activa");
-                    }
-                    break;
-                case 1:
-                    printf("│Estado: %-20s│", b->estado_actual);
-                    break;
-                case 2:
-                    if (b->procesando_orden && strlen(b->ingrediente_actual) > 0)
-                    {
-                        printf("│Ingrediente: %-16s│", b->ingrediente_actual);
-                    }
-                    else
-                    {
-                        printf("│%-31s│", "");
-                    }
-                    break;
-                case 3:
-                    if (b->procesando_orden)
-                    {
-                        printf("│Progreso: %d/%d pasos         │",
-                               b->orden_actual.paso_actual, b->orden_actual.num_ingredientes);
-                    }
-                    else
-                    {
-                        printf("│%-31s│", "");
-                    }
-                    break;
-                case 4:
-                    printf("│Procesadas: %-16d│", b->hamburguesas_procesadas);
-                    break;
-                case 5:
-                    printf("│%-31s│", "");
-                    break;
-                }
+                    Banda *b = &datos_compartidos->bandas[banda];
+                    pthread_mutex_lock(&b->mutex);
 
-                pthread_mutex_unlock(&b->mutex);
-                if (banda < banda_fin - 1)
-                    printf("  ");
+                    switch (linea)
+                    {
+                    case 0:
+                        if (b->procesando_orden)
+                        {
+                            char nombre_corto[16];
+                            strncpy(nombre_corto, b->orden_actual.nombre_hamburguesa, 15);
+                            nombre_corto[15] = '\0';
+                            sprintf(lineas_prep[col], "Orden %d: %s",
+                                    b->orden_actual.id_orden, nombre_corto);
+                        }
+                        else
+                        {
+                            strcpy(lineas_prep[col], "Sin orden activa");
+                        }
+                        break;
+                    case 1:
+                    {
+                        char estado_corto[22];
+                        strncpy(estado_corto, b->estado_actual, 21);
+                        estado_corto[21] = '\0';
+                        sprintf(lineas_prep[col], "Estado: %s", estado_corto);
+                    }
+                    break;
+                    case 2:
+                        if (b->procesando_orden && strlen(b->ingrediente_actual) > 0)
+                        {
+                            char ing_corto[16];
+                            strncpy(ing_corto, b->ingrediente_actual, 15);
+                            ing_corto[15] = '\0';
+                            sprintf(lineas_prep[col], "Ingrediente: %s", ing_corto);
+                        }
+                        else
+                        {
+                            strcpy(lineas_prep[col], "");
+                        }
+                        break;
+                    case 3:
+                        if (b->procesando_orden)
+                        {
+                            sprintf(lineas_prep[col], "Progreso: %d/%d pasos",
+                                    b->orden_actual.paso_actual, b->orden_actual.num_ingredientes);
+                        }
+                        else
+                        {
+                            strcpy(lineas_prep[col], "");
+                        }
+                        break;
+                    case 4:
+                        sprintf(lineas_prep[col], "Procesadas: %d", b->hamburguesas_procesadas);
+                        break;
+                    case 5:
+                        strcpy(lineas_prep[col], "");
+                        break;
+                    }
+
+                    pthread_mutex_unlock(&b->mutex);
+                }
+                else
+                {
+                    strcpy(lineas_prep[col], "");
+                }
             }
-            printf("\n");
+
+            imprimir_fila_contenido(lineas_prep, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
         }
 
         // Separador para logs
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("├─────────────────────────────────┤");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
 
-        // SECCIÓN: Logs
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
+        // SECCIÓN: LOGS
+        char subtitulo_logs[MAX_COLUMNAS][50];
+        for (int col = 0; col < num_columnas_fila; col++)
         {
-            printf("│             LOGS                │");
-            if (banda < banda_fin - 1)
-                printf("  ");
+            strcpy(subtitulo_logs[col], centrar_texto("LOGS", ANCHO_COLUMNA - 2));
         }
-        printf("\n");
+        imprimir_fila_contenido(subtitulo_logs, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
 
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("├─────────────────────────────────┤");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n");
+        // Separador logs
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
 
         // Mostrar últimos 8 logs de cada banda
         for (int log_line = 0; log_line < 8; log_line++)
         {
-            for (int banda = banda_inicio; banda < banda_fin; banda++)
-            {
-                Banda *b = &datos_compartidos->bandas[banda];
-                pthread_mutex_lock(&b->mutex);
+            char lineas_logs[MAX_COLUMNAS][50];
 
-                if (log_line < b->num_logs)
+            for (int col = 0; col < num_columnas_fila; col++)
+            {
+                int banda = banda_inicio + col;
+                if (banda < datos_compartidos->num_bandas)
                 {
-                    // Mostrar desde el más reciente hacia atrás
-                    int log_idx = b->num_logs - 1 - log_line;
-                    if (log_idx >= 0)
+                    Banda *b = &datos_compartidos->bandas[banda];
+                    pthread_mutex_lock(&b->mutex);
+
+                    if (log_line < b->num_logs)
                     {
-                        char log_corto[32];
-                        strncpy(log_corto, b->logs[log_idx].mensaje, 31);
-                        log_corto[31] = '\0';
-                        printf("│%-31s│", log_corto);
+                        int log_idx = b->num_logs - 1 - log_line;
+                        if (log_idx >= 0)
+                        {
+                            strncpy(lineas_logs[col], b->logs[log_idx].mensaje, 45);
+                            lineas_logs[col][45] = '\0';
+                        }
+                        else
+                        {
+                            strcpy(lineas_logs[col], "");
+                        }
                     }
                     else
                     {
-                        printf("│%-31s│", "");
+                        strcpy(lineas_logs[col], "");
                     }
+
+                    pthread_mutex_unlock(&b->mutex);
                 }
                 else
                 {
-                    printf("│%-31s│", "");
+                    strcpy(lineas_logs[col], "");
                 }
-
-                pthread_mutex_unlock(&b->mutex);
-                if (banda < banda_fin - 1)
-                    printf("  ");
             }
-            printf("\n");
+
+            imprimir_fila_contenido(lineas_logs, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
         }
 
-        // Cerrar columnas
-        for (int banda = banda_inicio; banda < banda_fin; banda++)
-        {
-            printf("└─────────────────────────────────┘");
-            if (banda < banda_fin - 1)
-                printf("  ");
-        }
-        printf("\n\n");
+        // BORDES INFERIORES
+        imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, '+', '+', '+', '-');
+        printf("\n");
     }
 
     printf("Presiona Ctrl+C para salir del sistema\n");
+}
+
+// Versión compacta para terminales pequeños
+void mostrar_estado_compacto()
+{
+    printf("\033[2J\033[H"); // Limpiar pantalla
+
+    printf("+-------------------------------------------------------------------+\n");
+    printf("|              SISTEMA DE HAMBURGUESAS - COMPACTO                   |\n");
+    printf("+-------------------------------------------------------------------+\n");
+    printf("Ordenes procesadas: %d | En cola: %d | Bandas: %d\n\n",
+           datos_compartidos->total_ordenes_procesadas,
+           datos_compartidos->cola_espera.tamano,
+           datos_compartidos->num_bandas);
+
+    for (int i = 0; i < datos_compartidos->num_bandas; i++)
+    {
+        Banda *b = &datos_compartidos->bandas[i];
+
+        pthread_mutex_lock(&b->mutex);
+
+        printf("BANDA %d: %s", i + 1,
+               b->pausada ? "[PAUSADA]" : (b->activa ? "[ACTIVA]" : "[INACT]"));
+
+        if (b->procesando_orden)
+        {
+            char nombre_corto[16];
+            strncpy(nombre_corto, b->orden_actual.nombre_hamburguesa, 15);
+            nombre_corto[15] = '\0';
+            printf(" | Orden %d: %s (%d/%d)",
+                   b->orden_actual.id_orden, nombre_corto,
+                   b->orden_actual.paso_actual, b->orden_actual.num_ingredientes);
+        }
+        else
+        {
+            char estado_corto[20];
+            strncpy(estado_corto, b->estado_actual, 19);
+            estado_corto[19] = '\0';
+            printf(" | %s", estado_corto);
+        }
+
+        printf(" | Procesadas: %d\n", b->hamburguesas_procesadas);
+
+        // Mostrar inventario crítico
+        printf("  Stock bajo: ");
+        int items_bajo = 0;
+        for (int j = 0; j < MAX_INGREDIENTES && items_bajo < 5; j++)
+        {
+            pthread_mutex_lock(&b->dispensadores[j].mutex);
+            if (b->dispensadores[j].cantidad <= 2)
+            {
+                char nombre_muy_corto[8];
+                strncpy(nombre_muy_corto, b->dispensadores[j].nombre, 7);
+                nombre_muy_corto[7] = '\0';
+                printf("%s(%d) ", nombre_muy_corto, b->dispensadores[j].cantidad);
+                items_bajo++;
+            }
+            pthread_mutex_unlock(&b->dispensadores[j].mutex);
+        }
+        if (items_bajo == 0)
+            printf("Ninguno");
+        printf("\n\n");
+
+        pthread_mutex_unlock(&b->mutex);
+    }
+
+    printf("Presiona Ctrl+C para salir del sistema\n");
+}
+
+// Función que detecta ancho de terminal y elige formato apropiado
+void mostrar_estado_adaptativo()
+{
+#ifdef TIOCGWINSZ
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0)
+    {
+        if (w.ws_col < 105)
+        {
+            mostrar_estado_compacto();
+            return;
+        }
+    }
+#endif
+
+    mostrar_estado_columnar();
 }
 
 void generar_orden_especifica(Orden *orden, int id)
@@ -883,7 +1087,6 @@ void manejar_senal(int sig)
         exit(0);
         break;
     case SIGUSR1:
-        // Pausar banda aleatoria
         if (datos_compartidos->num_bandas > 0)
         {
             int banda = rand() % datos_compartidos->num_bandas;
@@ -892,7 +1095,6 @@ void manejar_senal(int sig)
         }
         break;
     case SIGUSR2:
-        // Reanudar todas las bandas pausadas
         for (int i = 0; i < datos_compartidos->num_bandas; i++)
         {
             if (datos_compartidos->bandas[i].pausada)
@@ -904,12 +1106,11 @@ void manejar_senal(int sig)
         }
         break;
     case SIGCONT:
-        // Reabastecer banda aleatoria
-        {
-            int banda = rand() % datos_compartidos->num_bandas;
-            reabastecer_banda(banda);
-        }
-        break;
+    {
+        int banda = rand() % datos_compartidos->num_bandas;
+        reabastecer_banda(banda);
+    }
+    break;
     }
 }
 
@@ -934,7 +1135,7 @@ int validar_parametros(int argc, char *argv[], int *num_bandas)
                     printf("Error: Número de bandas debe estar entre 1 y %d\n", MAX_BANDAS);
                     return 0;
                 }
-                i++; // Saltar el siguiente argumento
+                i++;
             }
             else
             {
@@ -960,7 +1161,7 @@ int validar_parametros(int argc, char *argv[], int *num_bandas)
 
 void mostrar_ayuda()
 {
-    printf("Sistema de Preparación Automatizada de Hamburguesas v4.0 - Asignación Inteligente\n");
+    printf("Sistema de Preparación Automatizada de Hamburguesas v4.1 - Alineación Perfecta\n");
     printf("Uso: ./burger_system [opciones]\n\n");
     printf("Opciones:\n");
     printf("  -n, --bandas <N>     Número de bandas de preparación (1-%d, default: 3)\n", MAX_BANDAS);
@@ -969,10 +1170,11 @@ void mostrar_ayuda()
     printf("Características mejoradas:\n");
     printf("  • Soporte para hasta %d bandas dinámicamente\n", MAX_BANDAS);
     printf("  • Asignación inteligente - busca banda libre con recursos\n");
+    printf("  • Alineación perfecta de tablas - nunca se desalinea\n");
     printf("  • Cada banda tiene dispensadores independientes\n");
     printf("  • Generación automática cada 30 segundos\n");
     printf("  • Tiempo por ingrediente: 5 segundos\n");
-    printf("  • Layout dinámico (3 bandas por fila)\n");
+    printf("  • Layout adaptativo (compacto para terminales pequeños)\n");
     printf("  • Logs detallados por banda en tiempo real\n\n");
     printf("Controles durante ejecución:\n");
     printf("  Ctrl+C              Terminar sistema\n");
@@ -1024,6 +1226,7 @@ int main(int argc, char *argv[])
 
     printf("Sistema iniciado exitosamente con %d bandas\n", num_bandas);
     printf("Asignación inteligente de órdenes activada\n");
+    printf("Alineación perfecta de tablas garantizada\n");
     printf("Generando órdenes automáticamente cada 30 segundos\n");
     printf("Tiempo por ingrediente: 5 segundos\n");
     printf("PID del proceso: %d\n", getpid());
@@ -1032,11 +1235,11 @@ int main(int argc, char *argv[])
     // Esperar un momento antes de comenzar la interfaz
     sleep(3);
 
-    // Hilo principal maneja la interfaz de estado columnar
+    // Hilo principal maneja la interfaz de estado con alineación perfecta
     while (datos_compartidos->sistema_activo)
     {
-        mostrar_estado_columnar();
-        sleep(2); // Actualizar cada 2 segundos
+        mostrar_estado_adaptativo();
+        sleep(2);
     }
 
     // Limpiar recursos al final
