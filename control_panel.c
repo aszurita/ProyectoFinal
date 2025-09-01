@@ -975,7 +975,7 @@ void procesar_comando(int ch)
             pthread_mutex_lock(&banda->dispensadores[ingrediente_seleccionado].mutex);
             banda->dispensadores[ingrediente_seleccionado].cantidad = CAPACIDAD_DISPENSADOR;
             pthread_mutex_unlock(&banda->dispensadores[ingrediente_seleccionado].mutex);
-            char mensaje[50];
+            char mensaje[80];
             snprintf(mensaje, sizeof(mensaje), "[F] %s llenado completamente",
                      ingredientes_base[ingrediente_seleccionado]);
             mostrar_mensaje_temporal(mensaje);
@@ -1264,12 +1264,6 @@ int main()
         exit(1);
     }
 
-    printf("Iniciando interfaz de control mejorada...\n");
-    printf("Nuevas funcionalidades:\n");
-    printf("  * Vista de inventario completo por banda\n");
-    printf("  * Ajuste manual de ingredientes individuales\n");
-    printf("  * Modo de abastecimiento con múltiples opciones\n");
-    printf("  * Reabastecimiento selectivo (críticos, agotados)\n");
     sleep(2);
 
     // Inicializar interfaz
@@ -1337,7 +1331,7 @@ int main()
     // Limpiar recursos
     limpiar_ncurses();
 
-    printf("\nPanel de control mejorado terminado correctamente\n");
+    printf("\nPanel de control terminado correctamente\n");
     printf("Estadísticas finales:\n");
     printf("   * Órdenes procesadas: %d\n", datos_compartidos->total_ordenes_procesadas);
     printf("   * Órdenes en cola: %d\n", datos_compartidos->cola_espera.tamano);

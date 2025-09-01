@@ -427,7 +427,7 @@ void verificar_inventario_banda(int banda_id)
 
     if (ingredientes_agotados > 0)
     {
-        char mensaje_alerta[150];
+        char mensaje_alerta[250];
         snprintf(mensaje_alerta, sizeof(mensaje_alerta),
                  "ALERTA! BANDA %d SIN: %s", banda_id + 1, ingredientes_criticos);
         agregar_log_banda(banda_id, mensaje_alerta, 1);
