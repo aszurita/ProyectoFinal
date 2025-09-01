@@ -14,7 +14,7 @@
 #define MAX_ORDENES 100
 #define MAX_NOMBRE_INGREDIENTE 30
 #define MAX_LOGS_POR_BANDA 10
-#define CAPACIDAD_DISPENSADOR 20
+#define CAPACIDAD_DISPENSADOR 5
 #define NUM_TIPOS_HAMBURGUESA 6
 
 // Estructura para ingredientes por banda
@@ -455,14 +455,15 @@ void *generador_ordenes(void *arg)
         pthread_mutex_unlock(&datos_compartidos->mutex_global);
 
         // Generar nueva orden cada 30 segundos
-        sleep(30);
+        // Generar ordenes
+        sleep(5);
 
         // Ocasionalmente reabastecer una banda aleatoria
-        if (rand() % 5 == 0)
-        {
-            int banda_aleatoria = rand() % datos_compartidos->num_bandas;
-            reabastecer_banda(banda_aleatoria);
-        }
+        // if (rand() % 5 == 0)
+        //{
+        //    int banda_aleatoria = rand() % datos_compartidos->num_bandas;
+        //    reabastecer_banda(banda_aleatoria);
+        //}
     }
     return NULL;
 }
@@ -560,7 +561,8 @@ void procesar_orden(int banda_id, Orden *orden)
         agregar_log_banda(banda_id, log_msg);
 
         // 5 segundos por ingrediente
-        sleep(5);
+        // Ingredientes
+        sleep(3);
     }
 
     pthread_mutex_lock(&banda->mutex);
