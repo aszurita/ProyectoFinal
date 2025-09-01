@@ -18,6 +18,10 @@
 #define NUM_TIPOS_HAMBURGUESA 6
 #define UMBRAL_INVENTARIO_BAJO 2
 
+// Valores por defecto para tiempos
+#define TIEMPO_DEFAULT_INGREDIENTE 2 // 2 segundos por ingrediente
+#define TIEMPO_DEFAULT_NUEVA_ORDEN 7 // 7 segundos entre órdenes
+
 // Estructura para ingredientes por banda
 typedef struct
 {
@@ -55,7 +59,7 @@ typedef struct
     int paso_actual;
     int completada;
     int asignada_a_banda;
-    int intentos_asignacion; // Nueva: contar intentos de asignación
+    int intentos_asignacion;
 } Orden;
 
 // Estructura para una banda de preparación
@@ -99,9 +103,12 @@ typedef struct
     int num_bandas;
     int sistema_activo;
     int total_ordenes_procesadas;
-    int total_ordenes_generadas; // Nueva: para tracking
+    int total_ordenes_generadas;
     pthread_mutex_t mutex_global;
     pthread_cond_t nueva_orden;
+    // NUEVOS: Parámetros de tiempo configurables
+    int tiempo_por_ingrediente;
+    int tiempo_nueva_orden;
 } DatosCompartidos;
 
 // Variables globales
@@ -227,7 +234,7 @@ void imprimir_fila_contenido(char contenidos[][50], int num_columnas, int ancho_
 }
 
 // Prototipos de funciones
-void inicializar_sistema(int num_bandas);
+void inicializar_sistema(int num_bandas, int tiempo_ingrediente, int tiempo_orden);
 void mostrar_menu_hamburguesas();
 void *banda_worker(void *arg);
 void *generador_ordenes(void *arg);
@@ -248,14 +255,14 @@ void generar_orden_especifica(Orden *orden, int id);
 void reabastecer_banda(int banda_id);
 void limpiar_sistema();
 void manejar_senal(int sig);
-int validar_parametros(int argc, char *argv[], int *num_bandas);
+int validar_parametros(int argc, char *argv[], int *num_bandas, int *tiempo_ingrediente, int *tiempo_orden);
 void mostrar_ayuda();
 
 // ═══════════════════════════════════════════════════════════════
 // FUNCIONES DE INICIALIZACIÓN
 // ═══════════════════════════════════════════════════════════════
 
-void inicializar_sistema(int num_bandas)
+void inicializar_sistema(int num_bandas, int tiempo_ingrediente, int tiempo_orden)
 {
     // Limpiar memoria compartida previa
     shm_unlink("/burger_system");
@@ -283,6 +290,10 @@ void inicializar_sistema(int num_bandas)
     datos_compartidos->sistema_activo = 1;
     datos_compartidos->total_ordenes_procesadas = 0;
     datos_compartidos->total_ordenes_generadas = 0;
+
+    // NUEVO: Configurar tiempos
+    datos_compartidos->tiempo_por_ingrediente = tiempo_ingrediente;
+    datos_compartidos->tiempo_nueva_orden = tiempo_orden;
 
     // Inicializar mutex y condiciones globales
     pthread_mutex_init(&datos_compartidos->mutex_global, NULL);
@@ -324,6 +335,9 @@ void inicializar_sistema(int num_bandas)
     pthread_cond_init(&datos_compartidos->cola_espera.no_llena, NULL);
 
     printf("Sistema inicializado con %d bandas de preparación\n", num_bandas);
+    printf("Configuración de tiempos:\n");
+    printf("  • Tiempo por ingrediente: %d segundos\n", tiempo_ingrediente);
+    printf("  • Tiempo entre órdenes: %d segundos\n", tiempo_orden);
     mostrar_menu_hamburguesas();
 }
 
@@ -530,7 +544,9 @@ void *generador_ordenes(void *arg)
                nueva_orden.nombre_hamburguesa, nueva_orden.id_orden);
 
         pthread_cond_broadcast(&datos_compartidos->nueva_orden);
-        sleep(7); // Generar cada 7 segundos
+
+        // MODIFICADO: Usar tiempo configurado en lugar de valor fijo
+        sleep(datos_compartidos->tiempo_nueva_orden);
     }
     return NULL;
 }
@@ -633,7 +649,8 @@ void procesar_orden(int banda_id, Orden *orden)
         sprintf(log_msg, "Agregando %s...", orden->ingredientes_solicitados[i]);
         agregar_log_banda(banda_id, log_msg, 0);
 
-        sleep(2); // 2 segundos por ingrediente
+        // MODIFICADO: Usar tiempo configurado en lugar de valor fijo
+        sleep(datos_compartidos->tiempo_por_ingrediente);
     }
 
     pthread_mutex_lock(&banda->mutex);
@@ -756,7 +773,9 @@ void mostrar_estado_columnar()
            datos_compartidos->total_ordenes_procesadas,
            datos_compartidos->cola_espera.tamano,
            datos_compartidos->num_bandas);
-    printf("║ Nueva orden cada 7s │ Ingrediente cada 2s │ Asignacion inteligente FIFO                                    ║\n");
+    printf("║ Nueva orden cada %ds │ Ingrediente cada %ds │ Asignacion inteligente FIFO                                  ║\n",
+           datos_compartidos->tiempo_nueva_orden,
+           datos_compartidos->tiempo_por_ingrediente);
     printf("╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
 
     // Mostrar alertas de inventario
@@ -1034,7 +1053,9 @@ void mostrar_estado_columnar()
     }
 
     printf("Presiona Ctrl+C para salir del sistema\n");
-    printf("💡 Usa 'kill -CONT %d' para reabastecer bandas automáticamente\n", getpid());
+    printf("⏱️  Tiempos: %ds por ingrediente, %ds entre órdenes\n",
+           datos_compartidos->tiempo_por_ingrediente,
+           datos_compartidos->tiempo_nueva_orden);
 }
 
 void mostrar_estado_compacto()
@@ -1044,11 +1065,14 @@ void mostrar_estado_compacto()
     printf("╔═══════════════════════════════════════════════════════════════════╗\n");
     printf("║              SISTEMA DE HAMBURGUESAS - COMPACTO                   ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════╝\n");
-    printf("Generadas: %d │ Procesadas: %d │ En cola: %d │ Bandas: %d\n\n",
+    printf("Generadas: %d │ Procesadas: %d │ En cola: %d │ Bandas: %d\n",
            datos_compartidos->total_ordenes_generadas,
            datos_compartidos->total_ordenes_procesadas,
            datos_compartidos->cola_espera.tamano,
            datos_compartidos->num_bandas);
+    printf("⏱️ Tiempos: %ds/ingrediente │ %ds entre órdenes\n\n",
+           datos_compartidos->tiempo_por_ingrediente,
+           datos_compartidos->tiempo_nueva_orden);
 
     // Mostrar alertas
     int bandas_con_alertas = 0;
@@ -1212,6 +1236,9 @@ void limpiar_sistema()
     printf("- Órdenes generadas: %d\n", datos_compartidos->total_ordenes_generadas);
     printf("- Órdenes completadas: %d\n", datos_compartidos->total_ordenes_procesadas);
     printf("- Órdenes pendientes: %d\n", datos_compartidos->cola_espera.tamano);
+    printf("- Configuración de tiempos:\n");
+    printf("  • %d segundos por ingrediente\n", datos_compartidos->tiempo_por_ingrediente);
+    printf("  • %d segundos entre órdenes\n", datos_compartidos->tiempo_nueva_orden);
 }
 
 void manejar_senal(int sig)
@@ -1265,9 +1292,11 @@ void manejar_senal(int sig)
     }
 }
 
-int validar_parametros(int argc, char *argv[], int *num_bandas)
+int validar_parametros(int argc, char *argv[], int *num_bandas, int *tiempo_ingrediente, int *tiempo_orden)
 {
-    *num_bandas = 3; // Valor por defecto
+    *num_bandas = 3;                                  // Valor por defecto
+    *tiempo_ingrediente = TIEMPO_DEFAULT_INGREDIENTE; // 2 segundos por defecto
+    *tiempo_orden = TIEMPO_DEFAULT_NUEVA_ORDEN;       // 7 segundos por defecto
 
     for (int i = 1; i < argc; i++)
     {
@@ -1294,6 +1323,42 @@ int validar_parametros(int argc, char *argv[], int *num_bandas)
                 return 0;
             }
         }
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tiempo-ingrediente") == 0)
+        {
+            if (i + 1 < argc)
+            {
+                *tiempo_ingrediente = atoi(argv[i + 1]);
+                if (*tiempo_ingrediente <= 0 || *tiempo_ingrediente > 60)
+                {
+                    printf("Error: Tiempo por ingrediente debe estar entre 1 y 60 segundos\n");
+                    return 0;
+                }
+                i++;
+            }
+            else
+            {
+                printf("Error: -t requiere un número (segundos)\n");
+                return 0;
+            }
+        }
+        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--tiempo-orden") == 0)
+        {
+            if (i + 1 < argc)
+            {
+                *tiempo_orden = atoi(argv[i + 1]);
+                if (*tiempo_orden <= 0 || *tiempo_orden > 300)
+                {
+                    printf("Error: Tiempo entre órdenes debe estar entre 1 y 300 segundos\n");
+                    return 0;
+                }
+                i++;
+            }
+            else
+            {
+                printf("Error: -o requiere un número (segundos)\n");
+                return 0;
+            }
+        }
         else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--menu") == 0)
         {
             mostrar_menu_hamburguesas();
@@ -1311,41 +1376,27 @@ int validar_parametros(int argc, char *argv[], int *num_bandas)
 
 void mostrar_ayuda()
 {
-    printf("Sistema de Preparación Automatizada de Hamburguesas v5.0 - FIFO Inteligente\n");
+    printf("-----------------------------------------------------------------\n");
     printf("Uso: ./burger_system [opciones]\n\n");
     printf("Opciones:\n");
-    printf("  -n, --bandas <N>     Número de bandas de preparación (1-%d, default: 3)\n", MAX_BANDAS);
-    printf("  -m, --menu          Mostrar menú de hamburguesas disponibles\n");
-    printf("  -h, --help          Mostrar esta ayuda\n\n");
-    printf("Características:\n");
-    printf("  • Cola FIFO estricta - SIN órdenes rechazadas\n");
-    printf("  • Asignación inteligente - busca banda libre con inventario\n");
-    printf("  • Sistema de alertas de inventario en tiempo real\n");
-    printf("  • Timeout después de 20 intentos de asignación\n");
-    printf("  • Monitor automático de inventario cada 15 segundos\n");
-    printf("  • Cada banda tiene dispensadores independientes\n");
-    printf("  • Generación automática cada 7 segundos\n");
-    printf("  • Tiempo por ingrediente: 2 segundos\n");
-    printf("  • Layout adaptativo según tamaño de terminal\n");
-    printf("  • Capacidad por dispensador: %d ingredientes\n", CAPACIDAD_DISPENSADOR);
-    printf("  • Umbral crítico: %d ingredientes\n\n", UMBRAL_INVENTARIO_BAJO);
-    printf("Controles:\n");
-    printf("  Ctrl+C              Terminar sistema\n");
-    printf("  kill -USR1 <pid>    Pausar banda aleatoria\n");
-    printf("  kill -USR2 <pid>    Reanudar bandas pausadas\n");
-    printf("  kill -CONT <pid>    Reabastecer bandas con alertas\n\n");
-    printf("Indicadores:\n");
-    printf("  [AGOTADO]           0 ingredientes disponibles\n");
-    printf("  [CRITICO]           <= %d ingredientes disponibles\n", UMBRAL_INVENTARIO_BAJO);
-    printf("  ⚠️                  Banda requiere reabastecimiento\n");
-    printf("  🚨                  Alerta de inventario en logs\n");
+    printf("  -n, --bandas <N>           Número de bandas de preparación (1-%d, default: 3)\n", MAX_BANDAS);
+    printf("  -t, --tiempo-ingrediente <S> Segundos por ingrediente (1-60, default: %d)\n", TIEMPO_DEFAULT_INGREDIENTE);
+    printf("  -o, --tiempo-orden <S>     Segundos entre órdenes (1-300, default: %d)\n", TIEMPO_DEFAULT_NUEVA_ORDEN);
+    printf("  -m, --menu                Mostrar menú de hamburguesas disponibles\n");
+    printf("  -h, --help                Mostrar esta ayuda\n\n");
+    printf("Ejemplos de uso:\n");
+    printf("  ./burger_system -n 4                    # 4 bandas, tiempos por defecto\n");
+    printf("  ./burger_system -n 2 -t 3 -o 10         # 2 bandas, 3s/ingrediente, 10s entre órdenes\n");
+    printf("  ./burger_system -t 1 -o 5               # Tiempos rápidos: 1s/ingrediente, 5s entre órdenes\n");
+    printf("  ./burger_system -n 6 -t 5 -o 15         # 6 bandas, preparación lenta\n\n");
+    printf("-----------------------------------------------------------------\n");
 }
 
 int main(int argc, char *argv[])
 {
-    int num_bandas;
+    int num_bandas, tiempo_ingrediente, tiempo_orden;
 
-    if (!validar_parametros(argc, argv, &num_bandas))
+    if (!validar_parametros(argc, argv, &num_bandas, &tiempo_ingrediente, &tiempo_orden))
     {
         return 0;
     }
@@ -1358,7 +1409,7 @@ int main(int argc, char *argv[])
     signal(SIGCONT, manejar_senal);
 
     srand(time(NULL));
-    inicializar_sistema(num_bandas);
+    inicializar_sistema(num_bandas, tiempo_ingrediente, tiempo_orden);
 
     // Crear hilos de bandas
     int banda_ids[MAX_BANDAS];
@@ -1381,6 +1432,30 @@ int main(int argc, char *argv[])
     printf("Cola FIFO implementada - Sin rechazos por inventario\n");
     printf("Asignación inteligente activada\n");
     printf("Monitor de inventario ejecutándose\n");
+    printf("⏱️  CONFIGURACIÓN DE TIEMPOS:\n");
+    printf("   • %d segundos por ingrediente\n", tiempo_ingrediente);
+    printf("   • %d segundos entre órdenes nuevas\n", tiempo_orden);
+
+    // Calcular estadísticas estimadas
+    float hamburguesa_promedio = 6.5;                                                  // Promedio de ingredientes por hamburguesa
+    float tiempo_promedio_preparacion = hamburguesa_promedio * tiempo_ingrediente + 1; // +1 segundo final
+    float ordenes_por_minuto = 60.0 / tiempo_orden;
+    float capacidad_teorica = (60.0 / tiempo_promedio_preparacion) * num_bandas;
+
+    printf("📊 ESTIMACIONES DE RENDIMIENTO:\n");
+    printf("   • Tiempo promedio por hamburguesa: %.1f segundos\n", tiempo_promedio_preparacion);
+    printf("   • Órdenes generadas por minuto: %.1f\n", ordenes_por_minuto);
+    printf("   • Capacidad teórica del sistema: %.1f hamburguesas/minuto\n", capacidad_teorica);
+
+    if (ordenes_por_minuto > capacidad_teorica)
+    {
+        printf("⚠️  ADVERTENCIA: El sistema podría saturarse (cola crecerá)\n");
+    }
+    else
+    {
+        printf("✅ CONFIGURACIÓN: Sistema balanceado para esta carga\n");
+    }
+
     printf("PID del proceso: %d\n\n", getpid());
 
     sleep(3);
