@@ -16,6 +16,7 @@
 #define MAX_LOGS_POR_BANDA 10
 #define CAPACIDAD_DISPENSADOR 5
 #define NUM_TIPOS_HAMBURGUESA 6
+#define UMBRAL_INVENTARIO_BAJO 2 // Alerta cuando queden 2 o menos ingredientes
 
 // Estructura para ingredientes por banda
 typedef struct
@@ -39,6 +40,7 @@ typedef struct
 {
     char mensaje[100];
     time_t timestamp;
+    int es_alerta; // 1 si es una alerta de inventario, 0 normal
 } LogEntry;
 
 // Estructura para una orden específica
@@ -53,6 +55,7 @@ typedef struct
     int paso_actual;
     int completada;
     int asignada_a_banda;
+    int rechazada_por_inventario; // Nueva bandera para órdenes rechazadas
 } Orden;
 
 // Estructura para una banda de preparación
@@ -72,6 +75,8 @@ typedef struct
     pthread_cond_t condicion;
     char estado_actual[100];
     char ingrediente_actual[50];
+    int necesita_reabastecimiento;   // Nueva bandera para alertas
+    time_t ultima_alerta_inventario; // Para evitar spam de alertas
 } Banda;
 
 // Cola FIFO para órdenes en espera
@@ -94,6 +99,7 @@ typedef struct
     int num_bandas;
     int sistema_activo;
     int total_ordenes_procesadas;
+    int ordenes_rechazadas_inventario; // Contador de órdenes rechazadas
     pthread_mutex_t mutex_global;
     pthread_cond_t nueva_orden;
 } DatosCompartidos;
@@ -102,6 +108,7 @@ typedef struct
 DatosCompartidos *datos_compartidos;
 pthread_t hilo_generador_ordenes;
 pthread_t hilo_asignador_ordenes;
+pthread_t hilo_monitor_inventario; // Nuevo hilo para monitorear inventario
 
 // Menú de hamburguesas disponibles
 TipoHamburguesa menu_hamburguesas[NUM_TIPOS_HAMBURGUESA] = {
@@ -192,8 +199,7 @@ char *centrar_texto(const char *texto, int ancho)
 /**
  * Función para imprimir línea horizontal elegante
  */
-void imprimir_linea_separacion(int num_columnas, int ancho_columna, int separacion,
-                               const char *izq, const char *centro, const char *der, const char *relleno)
+void imprimir_linea_separacion(int num_columnas, int ancho_columna, int separacion, const char *izq, const char *centro, const char *der, const char *relleno)
 {
     for (int col = 0; col < num_columnas; col++)
     {
@@ -202,6 +208,7 @@ void imprimir_linea_separacion(int num_columnas, int ancho_columna, int separaci
             printf("%s", izq);
         }
 
+        // Imprimir el relleno para el ancho de la columna
         for (int i = 0; i < ancho_columna - 2; i++)
         {
             printf("%s", relleno);
@@ -229,6 +236,7 @@ void imprimir_fila_contenido(char contenidos[][50], int num_columnas, int ancho_
         printf("║%s║", formatear_texto_fijo(contenidos[col], ancho_columna - 2));
         if (col < num_columnas - 1)
         {
+            // Agregar espacios de separación entre columnas
             for (int i = 0; i < separacion; i++)
                 printf(" ");
         }
@@ -242,11 +250,14 @@ void mostrar_menu_hamburguesas();
 void *banda_worker(void *arg);
 void *generador_ordenes(void *arg);
 void *asignador_ordenes(void *arg);
+void *monitor_inventario(void *arg); // Nueva función
 void procesar_orden(int banda_id, Orden *orden);
 int verificar_ingredientes_banda(int banda_id, Orden *orden);
 void consumir_ingredientes_banda(int banda_id, Orden *orden);
 int encontrar_banda_disponible(Orden *orden);
-void agregar_log_banda(int banda_id, const char *mensaje);
+void agregar_log_banda(int banda_id, const char *mensaje, int es_alerta);
+void verificar_inventario_banda(int banda_id); // Nueva función
+void mostrar_alertas_inventario();             // Nueva función
 void encolar_orden(Orden *orden);
 Orden *desencolar_orden();
 void mostrar_estado_columnar();
@@ -289,6 +300,7 @@ void inicializar_sistema(int num_bandas)
     datos_compartidos->num_bandas = num_bandas;
     datos_compartidos->sistema_activo = 1;
     datos_compartidos->total_ordenes_procesadas = 0;
+    datos_compartidos->ordenes_rechazadas_inventario = 0;
 
     // Inicializar mutex y condiciones globales
     pthread_mutex_init(&datos_compartidos->mutex_global, NULL);
@@ -303,6 +315,8 @@ void inicializar_sistema(int num_bandas)
         datos_compartidos->bandas[i].hamburguesas_procesadas = 0;
         datos_compartidos->bandas[i].procesando_orden = 0;
         datos_compartidos->bandas[i].num_logs = 0;
+        datos_compartidos->bandas[i].necesita_reabastecimiento = 0;
+        datos_compartidos->bandas[i].ultima_alerta_inventario = 0;
         strcpy(datos_compartidos->bandas[i].estado_actual, "ESPERANDO");
         strcpy(datos_compartidos->bandas[i].ingrediente_actual, "");
         pthread_mutex_init(&datos_compartidos->bandas[i].mutex, NULL);
@@ -317,7 +331,7 @@ void inicializar_sistema(int num_bandas)
         }
 
         // Log inicial
-        agregar_log_banda(i, "BANDA INICIADA");
+        agregar_log_banda(i, "BANDA INICIADA", 0);
     }
 
     // Inicializar cola FIFO
@@ -329,6 +343,7 @@ void inicializar_sistema(int num_bandas)
     pthread_cond_init(&datos_compartidos->cola_espera.no_llena, NULL);
 
     printf("Sistema inicializado con %d bandas de preparación\n", num_bandas);
+    printf("Monitor de inventario activado\n");
     mostrar_menu_hamburguesas();
 }
 
@@ -347,10 +362,10 @@ void mostrar_menu_hamburguesas()
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FUNCIONES DE MANEJO DE LOGS
+// FUNCIONES DE MANEJO DE LOGS MEJORADAS
 // ═══════════════════════════════════════════════════════════════
 
-void agregar_log_banda(int banda_id, const char *mensaje)
+void agregar_log_banda(int banda_id, const char *mensaje, int es_alerta)
 {
     if (banda_id < 0 || banda_id >= datos_compartidos->num_bandas)
         return;
@@ -372,13 +387,127 @@ void agregar_log_banda(int banda_id, const char *mensaje)
     // Agregar nuevo log
     strcpy(banda->logs[banda->num_logs].mensaje, mensaje);
     banda->logs[banda->num_logs].timestamp = time(NULL);
+    banda->logs[banda->num_logs].es_alerta = es_alerta;
     banda->num_logs++;
 
     pthread_mutex_unlock(&banda->mutex);
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FUNCIONES DE HILOS DE TRABAJO
+// NUEVA FUNCIÓN PARA VERIFICAR INVENTARIO
+// ═══════════════════════════════════════════════════════════════
+
+void verificar_inventario_banda(int banda_id)
+{
+    if (banda_id < 0 || banda_id >= datos_compartidos->num_bandas)
+        return;
+
+    Banda *banda = &datos_compartidos->bandas[banda_id];
+    time_t ahora = time(NULL);
+
+    // Evitar spam de alertas (máximo una cada 30 segundos)
+    if (ahora - banda->ultima_alerta_inventario < 30)
+        return;
+
+    int ingredientes_bajos = 0;
+    int ingredientes_agotados = 0;
+    char ingredientes_criticos[200] = "";
+
+    for (int i = 0; i < MAX_INGREDIENTES; i++)
+    {
+        pthread_mutex_lock(&banda->dispensadores[i].mutex);
+        int cantidad = banda->dispensadores[i].cantidad;
+
+        if (cantidad == 0)
+        {
+            ingredientes_agotados++;
+            if (strlen(ingredientes_criticos) > 0)
+                strcat(ingredientes_criticos, ", ");
+            strcat(ingredientes_criticos, banda->dispensadores[i].nombre);
+        }
+        else if (cantidad <= UMBRAL_INVENTARIO_BAJO)
+        {
+            ingredientes_bajos++;
+        }
+
+        pthread_mutex_unlock(&banda->dispensadores[i].mutex);
+    }
+
+    // Generar alertas según la situación
+    if (ingredientes_agotados > 0)
+    {
+        char mensaje_alerta[150];
+        snprintf(mensaje_alerta, sizeof(mensaje_alerta),
+                 "¡ALERTA! BANDA %d SIN: %s", banda_id + 1, ingredientes_criticos);
+        agregar_log_banda(banda_id, mensaje_alerta, 1);
+
+        banda->necesita_reabastecimiento = 1;
+        banda->ultima_alerta_inventario = ahora;
+
+        printf("\n🚨 %s\n", mensaje_alerta);
+    }
+    else if (ingredientes_bajos >= 3)
+    {
+        char mensaje_alerta[100];
+        snprintf(mensaje_alerta, sizeof(mensaje_alerta),
+                 "AVISO: Banda %d necesita reabastecimiento", banda_id + 1);
+        agregar_log_banda(banda_id, mensaje_alerta, 1);
+
+        banda->necesita_reabastecimiento = 1;
+        banda->ultima_alerta_inventario = ahora;
+    }
+    else
+    {
+        banda->necesita_reabastecimiento = 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NUEVO HILO MONITOR DE INVENTARIO
+// ═══════════════════════════════════════════════════════════════
+
+void *monitor_inventario(void *arg)
+{
+    (void)arg;
+
+    while (datos_compartidos->sistema_activo)
+    {
+        // Verificar inventario de todas las bandas
+        for (int i = 0; i < datos_compartidos->num_bandas; i++)
+        {
+            verificar_inventario_banda(i);
+        }
+
+        // Mostrar alertas si las hay
+        mostrar_alertas_inventario();
+
+        // Esperar 15 segundos antes del próximo chequeo
+        sleep(15);
+    }
+
+    return NULL;
+}
+
+void mostrar_alertas_inventario()
+{
+    int bandas_con_alertas = 0;
+
+    for (int i = 0; i < datos_compartidos->num_bandas; i++)
+    {
+        if (datos_compartidos->bandas[i].necesita_reabastecimiento)
+        {
+            bandas_con_alertas++;
+        }
+    }
+
+    if (bandas_con_alertas > 0)
+    {
+        printf("\n⚠️  ALERTAS DE INVENTARIO: %d bandas necesitan reabastecimiento\n", bandas_con_alertas);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FUNCIONES DE HILOS DE TRABAJO MEJORADAS
 // ═══════════════════════════════════════════════════════════════
 
 void *banda_worker(void *arg)
@@ -430,7 +559,10 @@ void *banda_worker(void *arg)
 
         char log_msg[100];
         sprintf(log_msg, "COMPLETADA %s #%d", banda->orden_actual.nombre_hamburguesa, banda->orden_actual.id_orden);
-        agregar_log_banda(banda_id, log_msg);
+        agregar_log_banda(banda_id, log_msg, 0);
+
+        // Verificar inventario después de completar una orden
+        verificar_inventario_banda(banda_id);
     }
 
     return NULL;
@@ -445,6 +577,7 @@ void *generador_ordenes(void *arg)
     {
         Orden nueva_orden;
         generar_orden_especifica(&nueva_orden, contador_ordenes++);
+        nueva_orden.rechazada_por_inventario = 0;
         encolar_orden(&nueva_orden);
 
         printf("\n[NUEVA ORDEN] %s #%d generada - En cola\n",
@@ -454,16 +587,8 @@ void *generador_ordenes(void *arg)
         pthread_cond_broadcast(&datos_compartidos->nueva_orden);
         pthread_mutex_unlock(&datos_compartidos->mutex_global);
 
-        // Generar nueva orden cada 30 segundos
-        // Generar ordenes
+        // Generar nueva orden cada 5 segundos para testing
         sleep(5);
-
-        // Ocasionalmente reabastecer una banda aleatoria
-        // if (rand() % 5 == 0)
-        //{
-        //    int banda_aleatoria = rand() % datos_compartidos->num_bandas;
-        //    reabastecer_banda(banda_aleatoria);
-        //}
     }
     return NULL;
 }
@@ -494,13 +619,27 @@ void *asignador_ordenes(void *arg)
 
                 char log_msg[100];
                 sprintf(log_msg, "ASIGNADA %s #%d", orden->nombre_hamburguesa, orden->id_orden);
-                agregar_log_banda(banda_asignada, log_msg);
+                agregar_log_banda(banda_asignada, log_msg, 0);
             }
             else
             {
-                // No hay bandas disponibles con recursos, re-encolar
+                // No hay bandas disponibles con recursos
+                if (!orden->rechazada_por_inventario)
+                {
+                    orden->rechazada_por_inventario = 1;
+
+                    pthread_mutex_lock(&datos_compartidos->mutex_global);
+                    datos_compartidos->ordenes_rechazadas_inventario++;
+                    pthread_mutex_unlock(&datos_compartidos->mutex_global);
+
+                    printf("\n❌ [INVENTARIO INSUFICIENTE] Orden %s #%d no puede ser procesada\n",
+                           orden->nombre_hamburguesa, orden->id_orden);
+                    printf("   Todas las bandas carecen de ingredientes necesarios\n");
+                }
+
+                // Re-encolar para intentar más tarde
                 encolar_orden(orden);
-                sleep(2);
+                sleep(5); // Esperar más tiempo cuando hay problemas de inventario
             }
         }
         else
@@ -543,12 +682,12 @@ void procesar_orden(int banda_id, Orden *orden)
 
     char log_msg[100];
     sprintf(log_msg, "INICIANDO %s #%d", orden->nombre_hamburguesa, orden->id_orden);
-    agregar_log_banda(banda_id, log_msg);
+    agregar_log_banda(banda_id, log_msg, 0);
 
     // Consumir ingredientes de los dispensadores de esta banda
     consumir_ingredientes_banda(banda_id, orden);
 
-    // Simular preparación paso a paso (5 segundos por ingrediente)
+    // Simular preparación paso a paso (3 segundos por ingrediente)
     for (int i = 0; i < orden->num_ingredientes; i++)
     {
         pthread_mutex_lock(&banda->mutex);
@@ -558,10 +697,9 @@ void procesar_orden(int banda_id, Orden *orden)
         pthread_mutex_unlock(&banda->mutex);
 
         sprintf(log_msg, "Agregando %s...", orden->ingredientes_solicitados[i]);
-        agregar_log_banda(banda_id, log_msg);
+        agregar_log_banda(banda_id, log_msg, 0);
 
-        // 5 segundos por ingrediente
-        // Ingredientes
+        // 3 segundos por ingrediente
         sleep(3);
     }
 
@@ -569,7 +707,7 @@ void procesar_orden(int banda_id, Orden *orden)
     sprintf(banda->estado_actual, "FINALIZANDO %s", orden->nombre_hamburguesa);
     pthread_mutex_unlock(&banda->mutex);
 
-    agregar_log_banda(banda_id, "HAMBURGUESA LISTA!");
+    agregar_log_banda(banda_id, "HAMBURGUESA LISTA!", 0);
     sleep(2); // Tiempo final de empaque
 }
 
@@ -670,7 +808,7 @@ Orden *desencolar_orden()
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FUNCIÓN DE DISPLAY COLUMNAR MEJORADO CON FORMATO ELEGANTE
+// FUNCIÓN DE DISPLAY COLUMNAR MEJORADO CON ALERTAS DE INVENTARIO
 // ═══════════════════════════════════════════════════════════════
 
 void mostrar_estado_columnar()
@@ -680,17 +818,43 @@ void mostrar_estado_columnar()
     // Encabezado general del sistema con formato elegante
     printf("╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
     printf("║                                      SISTEMA DE HAMBURGUESAS - ESTADO                                         ║\n");
-    printf("║ Total ordenes procesadas: %-6d  │  Ordenes en cola: %-6d  │  Bandas activas: %-6d                       ║\n",
-           datos_compartidos->total_ordenes_procesadas, datos_compartidos->cola_espera.tamano, datos_compartidos->num_bandas);
-    printf("║ Nueva orden cada 30s │ Ingrediente cada 5s │ Asignacion inteligente de bandas                                 ║\n");
-    printf("╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n\n");
+    printf("║ Total procesadas: %-6d  │  En cola: %-6d  │  Rechazadas: %-6d  │  Bandas: %-6d                    ║\n",
+           datos_compartidos->total_ordenes_procesadas,
+           datos_compartidos->cola_espera.tamano,
+           datos_compartidos->ordenes_rechazadas_inventario,
+           datos_compartidos->num_bandas);
+    printf("║ Nueva orden cada 5s │ Ingrediente cada 3s │ Asignacion inteligente de bandas                                 ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
 
-    // Constantes para layout perfecto
-    const int ANCHO_COLUMNA = 40;
-    const int SEPARACION = 2;
-    const int MAX_COLUMNAS = 10;
+    // Mostrar alertas de inventario si las hay
+    int bandas_con_alertas = 0;
+    for (int i = 0; i < datos_compartidos->num_bandas; i++)
+    {
+        if (datos_compartidos->bandas[i].necesita_reabastecimiento)
+        {
+            bandas_con_alertas++;
+        }
+    }
 
-    // Calcular distribución de bandas en filas
+    if (bandas_con_alertas > 0)
+    {
+        printf("\n🚨 ALERTAS DE INVENTARIO: %d bandas necesitan reabastecimiento 🚨\n", bandas_con_alertas);
+        for (int i = 0; i < datos_compartidos->num_bandas; i++)
+        {
+            if (datos_compartidos->bandas[i].necesita_reabastecimiento)
+            {
+                printf("   ⚠️  BANDA %d requiere reabastecimiento urgente\n", i + 1);
+            }
+        }
+        printf("\n");
+    }
+
+    // Constantes para layout perfecto - AJUSTADAS
+    const int ANCHO_COLUMNA = 40; // Volviendo al valor original
+    const int SEPARACION = 2;     // Volviendo al valor original
+    const int MAX_COLUMNAS = 3;   // Máximo 3 columnas para mejor control
+
+    // Calcular número de filas necesarias
     int filas_bandas = (datos_compartidos->num_bandas + MAX_COLUMNAS - 1) / MAX_COLUMNAS;
 
     for (int fila = 0; fila < filas_bandas; fila++)
@@ -702,12 +866,13 @@ void mostrar_estado_columnar()
         // BORDES SUPERIORES
         imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, "╔", "╗  ╔", "╗", "═");
 
-        // ENCABEZADOS DE BANDAS
+        // ENCABEZADOS DE BANDAS con indicador de alerta
         char titulos[MAX_COLUMNAS][50];
         for (int col = 0; col < num_columnas_fila; col++)
         {
-            sprintf(titulos[col], "BANDA %d", banda_inicio + col + 1);
-            strcpy(titulos[col], centrar_texto(titulos[col], ANCHO_COLUMNA - 6));
+            int banda_actual = banda_inicio + col;
+            sprintf(titulos[col], "BANDA %d", banda_actual + 1);
+            strcpy(titulos[col], centrar_texto(titulos[col], ANCHO_COLUMNA - 2));
         }
         imprimir_fila_contenido(titulos, num_columnas_fila, ANCHO_COLUMNA, SEPARACION);
 
@@ -725,7 +890,7 @@ void mostrar_estado_columnar()
         // Separador inventario
         imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, "╠", "╣  ╠", "╣", "─");
 
-        // Mostrar inventario (8 líneas fijas)
+        // Mostrar inventario (8 líneas fijas) con indicadores mejorados
         for (int ing = 0; ing < 8; ing++)
         {
             char lineas_inventario[MAX_COLUMNAS][50];
@@ -738,23 +903,23 @@ void mostrar_estado_columnar()
                     Banda *b = &datos_compartidos->bandas[banda];
                     pthread_mutex_lock(&b->dispensadores[ing].mutex);
 
-                    char nombre_corto[13];
-                    strncpy(nombre_corto, b->dispensadores[ing].nombre, 12);
-                    nombre_corto[12] = '\0';
+                    char nombre_corto[15];
+                    strncpy(nombre_corto, b->dispensadores[ing].nombre, 14);
+                    nombre_corto[14] = '\0';
 
                     int cantidad = b->dispensadores[ing].cantidad;
 
                     if (cantidad == 0)
                     {
-                        sprintf(lineas_inventario[col], "%-12s: %2d [VACIO]", nombre_corto, cantidad);
+                        sprintf(lineas_inventario[col], "%-14s: %2d [AGOTADO]", nombre_corto, cantidad);
                     }
-                    else if (cantidad <= 2)
+                    else if (cantidad <= UMBRAL_INVENTARIO_BAJO)
                     {
-                        sprintf(lineas_inventario[col], "%-12s: %2d [BAJO]", nombre_corto, cantidad);
+                        sprintf(lineas_inventario[col], "%-14s: %2d [CRÍTICO]", nombre_corto, cantidad);
                     }
                     else
                     {
-                        sprintf(lineas_inventario[col], "%-12s: %2d", nombre_corto, cantidad);
+                        sprintf(lineas_inventario[col], "%-14s: %2d", nombre_corto, cantidad);
                     }
 
                     pthread_mutex_unlock(&b->dispensadores[ing].mutex);
@@ -800,9 +965,9 @@ void mostrar_estado_columnar()
                     case 0:
                         if (b->procesando_orden)
                         {
-                            char nombre_corto[16];
-                            strncpy(nombre_corto, b->orden_actual.nombre_hamburguesa, 15);
-                            nombre_corto[15] = '\0';
+                            char nombre_corto[18];
+                            strncpy(nombre_corto, b->orden_actual.nombre_hamburguesa, 17);
+                            nombre_corto[17] = '\0';
                             sprintf(lineas_prep[col], "Orden %d: %s",
                                     b->orden_actual.id_orden, nombre_corto);
                         }
@@ -813,18 +978,18 @@ void mostrar_estado_columnar()
                         break;
                     case 1:
                     {
-                        char estado_corto[22];
-                        strncpy(estado_corto, b->estado_actual, 21);
-                        estado_corto[21] = '\0';
+                        char estado_corto[25];
+                        strncpy(estado_corto, b->estado_actual, 24);
+                        estado_corto[24] = '\0';
                         sprintf(lineas_prep[col], "Estado: %s", estado_corto);
                     }
                     break;
                     case 2:
                         if (b->procesando_orden && strlen(b->ingrediente_actual) > 0)
                         {
-                            char ing_corto[16];
-                            strncpy(ing_corto, b->ingrediente_actual, 15);
-                            ing_corto[15] = '\0';
+                            char ing_corto[18];
+                            strncpy(ing_corto, b->ingrediente_actual, 17);
+                            ing_corto[17] = '\0';
                             sprintf(lineas_prep[col], "Ingrediente: %s", ing_corto);
                         }
                         else
@@ -876,7 +1041,7 @@ void mostrar_estado_columnar()
         // Separador logs
         imprimir_linea_separacion(num_columnas_fila, ANCHO_COLUMNA, SEPARACION, "╠", "╣  ╠", "╣", "─");
 
-        // Mostrar últimos 8 logs de cada banda
+        // Mostrar últimos 8 logs de cada banda con indicadores de alerta
         for (int log_line = 0; log_line < 8; log_line++)
         {
             char lineas_logs[MAX_COLUMNAS][50];
@@ -894,8 +1059,10 @@ void mostrar_estado_columnar()
                         int log_idx = b->num_logs - 1 - log_line;
                         if (log_idx >= 0)
                         {
-                            strncpy(lineas_logs[col], b->logs[log_idx].mensaje, 43);
-                            lineas_logs[col][43] = '\0';
+                            char log_texto[44];
+                            strncpy(log_texto, b->logs[log_idx].mensaje, 40);
+                            log_texto[40] = '\0';
+                            strcpy(lineas_logs[col], log_texto);
                         }
                         else
                         {
@@ -924,9 +1091,13 @@ void mostrar_estado_columnar()
     }
 
     printf("Presiona Ctrl+C para salir del sistema\n");
+    if (datos_compartidos->ordenes_rechazadas_inventario > 0)
+    {
+        printf("💡 Usa 'kill -CONT %d' para reabastecer bandas automáticamente\n", getpid());
+    }
 }
 
-// Versión compacta para terminales pequeños
+// Versión compacta para terminales pequeños con alertas
 void mostrar_estado_compacto()
 {
     printf("\033[2J\033[H"); // Limpiar pantalla
@@ -934,10 +1105,26 @@ void mostrar_estado_compacto()
     printf("╔═══════════════════════════════════════════════════════════════════╗\n");
     printf("║              SISTEMA DE HAMBURGUESAS - COMPACTO                   ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════╝\n");
-    printf("Ordenes procesadas: %d │ En cola: %d │ Bandas: %d\n\n",
+    printf("Procesadas: %d │ En cola: %d │ Rechazadas: %d │ Bandas: %d\n\n",
            datos_compartidos->total_ordenes_procesadas,
            datos_compartidos->cola_espera.tamano,
+           datos_compartidos->ordenes_rechazadas_inventario,
            datos_compartidos->num_bandas);
+
+    // Mostrar alertas de inventario
+    int bandas_con_alertas = 0;
+    for (int i = 0; i < datos_compartidos->num_bandas; i++)
+    {
+        if (datos_compartidos->bandas[i].necesita_reabastecimiento)
+        {
+            bandas_con_alertas++;
+        }
+    }
+
+    if (bandas_con_alertas > 0)
+    {
+        printf("🚨 ALERTAS: %d bandas necesitan reabastecimiento\n\n", bandas_con_alertas);
+    }
 
     for (int i = 0; i < datos_compartidos->num_bandas; i++)
     {
@@ -945,8 +1132,9 @@ void mostrar_estado_compacto()
 
         pthread_mutex_lock(&b->mutex);
 
-        printf("BANDA %d: %s", i + 1,
-               b->pausada ? "[PAUSADA]" : (b->activa ? "[ACTIVA]" : "[INACT]"));
+        printf("BANDA %d: %s%s", i + 1,
+               b->pausada ? "[PAUSADA]" : (b->activa ? "[ACTIVA]" : "[INACT]"),
+               b->necesita_reabastecimiento ? "" : "");
 
         if (b->procesando_orden)
         {
@@ -967,23 +1155,31 @@ void mostrar_estado_compacto()
 
         printf(" │ Procesadas: %d\n", b->hamburguesas_procesadas);
 
-        // Mostrar inventario crítico
-        printf("  Stock bajo: ");
-        int items_bajo = 0;
-        for (int j = 0; j < MAX_INGREDIENTES && items_bajo < 5; j++)
+        // Mostrar inventario crítico y agotado
+        printf("  Stock crítico: ");
+        int items_criticos = 0;
+        for (int j = 0; j < MAX_INGREDIENTES && items_criticos < 5; j++)
         {
             pthread_mutex_lock(&b->dispensadores[j].mutex);
-            if (b->dispensadores[j].cantidad <= 2)
+            if (b->dispensadores[j].cantidad == 0)
+            {
+                char nombre_muy_corto[8];
+                strncpy(nombre_muy_corto, b->dispensadores[j].nombre, 7);
+                nombre_muy_corto[7] = '\0';
+                printf("%s(AGOTADO) ", nombre_muy_corto);
+                items_criticos++;
+            }
+            else if (b->dispensadores[j].cantidad <= UMBRAL_INVENTARIO_BAJO)
             {
                 char nombre_muy_corto[8];
                 strncpy(nombre_muy_corto, b->dispensadores[j].nombre, 7);
                 nombre_muy_corto[7] = '\0';
                 printf("%s(%d) ", nombre_muy_corto, b->dispensadores[j].cantidad);
-                items_bajo++;
+                items_criticos++;
             }
             pthread_mutex_unlock(&b->dispensadores[j].mutex);
         }
-        if (items_bajo == 0)
+        if (items_criticos == 0)
             printf("Ninguno");
         printf("\n\n");
 
@@ -991,6 +1187,10 @@ void mostrar_estado_compacto()
     }
 
     printf("Presiona Ctrl+C para salir del sistema\n");
+    if (datos_compartidos->ordenes_rechazadas_inventario > 0)
+    {
+        printf("💡 Usa señales para reabastecer bandas\n");
+    }
 }
 
 // Función que detecta ancho de terminal y elige formato apropiado
@@ -1025,6 +1225,7 @@ void generar_orden_especifica(Orden *orden, int id)
     orden->paso_actual = 0;
     orden->completada = 0;
     orden->asignada_a_banda = -1;
+    orden->rechazada_por_inventario = 0;
 
     // Copiar ingredientes específicos de esta hamburguesa
     for (int i = 0; i < hamburguesa->num_ingredientes; i++)
@@ -1044,7 +1245,12 @@ void reabastecer_banda(int banda_id)
             pthread_mutex_unlock(&datos_compartidos->bandas[banda_id].dispensadores[i].mutex);
         }
 
-        agregar_log_banda(banda_id, "BANDA REABASTECIDA");
+        // Limpiar bandera de reabastecimiento
+        datos_compartidos->bandas[banda_id].necesita_reabastecimiento = 0;
+        datos_compartidos->bandas[banda_id].ultima_alerta_inventario = 0;
+
+        agregar_log_banda(banda_id, "BANDA REABASTECIDA", 0);
+        printf("\n✅ Banda %d reabastecida completamente\n", banda_id + 1);
     }
 }
 
@@ -1069,10 +1275,14 @@ void limpiar_sistema()
     // Esperar hilos del sistema
     pthread_join(hilo_generador_ordenes, NULL);
     pthread_join(hilo_asignador_ordenes, NULL);
+    pthread_join(hilo_monitor_inventario, NULL);
 
     // Limpiar memoria compartida
     shm_unlink("/burger_system");
     printf("\nSistema terminado correctamente\n");
+    printf("Estadísticas finales:\n");
+    printf("- Órdenes completadas: %d\n", datos_compartidos->total_ordenes_procesadas);
+    printf("- Órdenes rechazadas por inventario: %d\n", datos_compartidos->ordenes_rechazadas_inventario);
 }
 
 void manejar_senal(int sig)
@@ -1090,7 +1300,7 @@ void manejar_senal(int sig)
         {
             int banda = rand() % datos_compartidos->num_bandas;
             datos_compartidos->bandas[banda].pausada = 1;
-            agregar_log_banda(banda, "BANDA PAUSADA POR SEÑAL");
+            agregar_log_banda(banda, "BANDA PAUSADA POR SEÑAL", 0);
         }
         break;
     case SIGUSR2:
@@ -1100,14 +1310,29 @@ void manejar_senal(int sig)
             {
                 datos_compartidos->bandas[i].pausada = 0;
                 pthread_cond_signal(&datos_compartidos->bandas[i].condicion);
-                agregar_log_banda(i, "BANDA REANUDADA");
+                agregar_log_banda(i, "BANDA REANUDADA", 0);
             }
         }
         break;
     case SIGCONT:
     {
-        int banda = rand() % datos_compartidos->num_bandas;
-        reabastecer_banda(banda);
+        // Reabastecer todas las bandas que necesiten reabastecimiento
+        int bandas_reabastecidas = 0;
+        for (int i = 0; i < datos_compartidos->num_bandas; i++)
+        {
+            if (datos_compartidos->bandas[i].necesita_reabastecimiento)
+            {
+                reabastecer_banda(i);
+                bandas_reabastecidas++;
+            }
+        }
+        if (bandas_reabastecidas == 0)
+        {
+            // Si ninguna necesitaba, reabastecer una aleatoria
+            int banda = rand() % datos_compartidos->num_bandas;
+            reabastecer_banda(banda);
+        }
+        printf("\n📦 Reabastecimiento automático completado\n");
     }
     break;
     }
@@ -1160,7 +1385,7 @@ int validar_parametros(int argc, char *argv[], int *num_bandas)
 
 void mostrar_ayuda()
 {
-    printf("Sistema de Preparación Automatizada de Hamburguesas v4.2 - Formato Elegante\n");
+    printf("Sistema de Preparación Automatizada de Hamburguesas v4.3 - Con Alertas de Inventario\n");
     printf("Uso: ./burger_system [opciones]\n\n");
     printf("Opciones:\n");
     printf("  -n, --bandas <N>     Número de bandas de preparación (1-%d, default: 3)\n", MAX_BANDAS);
@@ -1169,17 +1394,28 @@ void mostrar_ayuda()
     printf("Características mejoradas:\n");
     printf("  • Soporte para hasta %d bandas dinámicamente\n", MAX_BANDAS);
     printf("  • Asignación inteligente - busca banda libre con recursos\n");
+    printf("  • Sistema de alertas de inventario en tiempo real\n");
+    printf("  • Mensajes de inventario insuficiente para órdenes rechazadas\n");
+    printf("  • Monitor automático de inventario cada 15 segundos\n");
+    printf("  • Logs con indicadores de alerta (🚨)\n");
     printf("  • Formato elegante con caracteres Unicode\n");
     printf("  • Cada banda tiene dispensadores independientes\n");
-    printf("  • Generación automática cada 30 segundos\n");
-    printf("  • Tiempo por ingrediente: 5 segundos\n");
+    printf("  • Generación automática cada 5 segundos\n");
+    printf("  • Tiempo por ingrediente: 3 segundos\n");
     printf("  • Layout adaptativo (compacto para terminales pequeños)\n");
-    printf("  • Logs detallados por banda en tiempo real\n\n");
+    printf("  • Logs detallados por banda en tiempo real\n");
+    printf("  • Umbral de inventario bajo: %d ingredientes\n", UMBRAL_INVENTARIO_BAJO);
+    printf("  • Contador de órdenes rechazadas por falta de inventario\n\n");
     printf("Controles durante ejecución:\n");
     printf("  Ctrl+C              Terminar sistema\n");
     printf("  kill -USR1 <pid>    Pausar banda aleatoria\n");
     printf("  kill -USR2 <pid>    Reanudar bandas pausadas\n");
-    printf("  kill -CONT <pid>    Reabastecer banda aleatoria\n");
+    printf("  kill -CONT <pid>    Reabastecer bandas que necesiten inventario\n\n");
+    printf("Indicadores de inventario:\n");
+    printf("  [AGOTADO]           0 ingredientes disponibles\n");
+    printf("  [CRÍTICO]           <= %d ingredientes disponibles\n", UMBRAL_INVENTARIO_BAJO);
+    printf("  ⚠️                  Banda requiere reabastecimiento\n");
+    printf("  🚨                  Log de alerta de inventario\n");
 }
 
 int main(int argc, char *argv[])
@@ -1223,18 +1459,24 @@ int main(int argc, char *argv[])
     // Crear hilo asignador inteligente de órdenes
     pthread_create(&hilo_asignador_ordenes, NULL, asignador_ordenes, NULL);
 
+    // Crear hilo monitor de inventario
+    pthread_create(&hilo_monitor_inventario, NULL, monitor_inventario, NULL);
+
     printf("Sistema iniciado exitosamente con %d bandas\n", num_bandas);
     printf("Asignación inteligente de órdenes activada\n");
+    printf("Sistema de alertas de inventario activado\n");
+    printf("Monitor de inventario ejecutándose cada 15 segundos\n");
     printf("Formato elegante con caracteres Unicode activado\n");
-    printf("Generando órdenes automáticamente cada 30 segundos\n");
-    printf("Tiempo por ingrediente: 5 segundos\n");
+    printf("Generando órdenes automáticamente cada 5 segundos\n");
+    printf("Tiempo por ingrediente: 3 segundos\n");
+    printf("Umbral de inventario bajo: %d ingredientes\n", UMBRAL_INVENTARIO_BAJO);
     printf("PID del proceso: %d\n", getpid());
     printf("Presiona Ctrl+C para terminar\n\n");
 
     // Esperar un momento antes de comenzar la interfaz
     sleep(3);
 
-    // Hilo principal maneja la interfaz de estado con formato elegante
+    // Hilo principal maneja la interfaz de estado con formato elegante y alertas
     while (datos_compartidos->sistema_activo)
     {
         mostrar_estado_adaptativo();
