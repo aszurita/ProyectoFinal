@@ -1,3 +1,83 @@
+/**
+ * @file control_panel.c
+ * @brief Panel de Control Interactivo para el Sistema de Hamburguesas
+ * @author Angelo Zurita
+ * @date 01/09/2025
+ * @version 1.0
+ *
+ * @section descripcion Descripción del Panel de Control
+ *
+ * Este panel de control proporciona una interfaz interactiva y en tiempo real
+ * para monitorear y controlar el sistema de hamburguesas. Utiliza la biblioteca
+ * ncurses para crear una interfaz gráfica en terminal que permite:
+ *
+ * - Monitoreo en tiempo real del estado de todas las bandas
+ * - Control directo de bandas (pausar/reanudar)
+ * - Gestión de inventario y reabastecimiento
+ * - Visualización de estadísticas del sistema
+ * - Navegación intuitiva entre diferentes vistas
+ *
+ * @section arquitectura Arquitectura del Panel de Control
+ *
+ * El panel se conecta al sistema principal a través de memoria compartida POSIX
+ * y proporciona las siguientes funcionalidades principales:
+ *
+ * 1. INTERFAZ GENERAL: Vista resumida de todas las bandas y estadísticas
+ * 2. DETALLE DE BANDA: Información específica de una banda seleccionada
+ * 3. INVENTARIO GLOBAL: Resumen de inventarios por ingrediente
+ * 4. INVENTARIO DE BANDA: Gestión detallada del inventario de una banda
+ * 5. MODO ABASTECIMIENTO: Operaciones masivas de reabastecimiento
+ *
+ * @section interfaz Características de la Interfaz
+ *
+ * - **INTERFAZ ADAPTATIVA**: Se ajusta automáticamente al tamaño de pantalla
+ * - **COLORES INTELIGENTES**: Sistema de colores para alertas y estados
+ * - **NAVEGACIÓN INTUITIVA**: Controles de teclado consistentes y fáciles de usar
+ * - **ACTUALIZACIÓN EN TIEMPO REAL**: Refresco automático de información
+ * - **MÚLTIPLES VISTAS**: Diferentes modos de visualización según necesidades
+ *
+ * @section controles Controles del Usuario
+ *
+ * - **NAVEGACIÓN**: Flechas arriba/abajo, TAB para cambiar vistas
+ * - **CONTROL**: ESPACIO para pausar/reanudar, R para reabastecer
+ * - **INVENTARIO**: +/- para ajustar cantidades, F para llenar
+ * - **ABASTECIMIENTO**: 1-5 para opciones, A/C/E para operaciones rápidas
+ * - **SISTEMA**: H para ayuda, Q para salir
+ *
+ * @section dependencias Dependencias del Sistema
+ *
+ * - ncurses: Para interfaz gráfica en terminal
+ * - pthread: Para sincronización con el sistema principal
+ * - librt: Para acceso a memoria compartida POSIX
+ * - Sistema operativo compatible con POSIX
+ *
+ * @section compilacion Compilación
+ *
+ * Para compilar el panel de control:
+ * @code
+ * make control_panel
+ * @endcode
+ *
+ * @section ejecucion Ejecución
+ *
+ * Uso:
+ * @code
+ * # Primero ejecutar el sistema principal
+ * ./burger_system -n 4 &
+ *
+ * # Luego ejecutar el panel de control
+ * ./control_panel
+ * @endcode
+ *
+ * @section licencia Licencia
+ *
+ * Este software es propiedad de [Tu Institución/Organización]
+ *
+ * @section contacto Contacto
+ *
+ * Para soporte técnico o consultas: [tu-email@dominio.com]
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,141 +90,510 @@
 #include <sys/types.h>
 #include <time.h>
 
+/**
+ * @defgroup constantes_panel Constantes del Panel de Control
+ * @{
+ *
+ * Las constantes deben coincidir exactamente con las del sistema principal
+ * para garantizar compatibilidad en la memoria compartida.
+ */
+
+/** @brief Número máximo de bandas que puede manejar el panel */
 #define MAX_BANDAS 10
+
+/** @brief Número máximo de ingredientes diferentes en el sistema */
 #define MAX_INGREDIENTES 15
+
+/** @brief Capacidad máxima de la cola de órdenes */
 #define MAX_ORDENES 100
+
+/** @brief Longitud máxima del nombre de un ingrediente */
 #define MAX_NOMBRE_INGREDIENTE 30
+
+/** @brief Número máximo de entradas de log por banda */
 #define MAX_LOGS_POR_BANDA 10
+
+/** @brief Capacidad máxima de cada dispensador de ingredientes */
 #define CAPACIDAD_DISPENSADOR 10
+
+/** @brief Número de tipos de hamburguesas disponibles */
 #define NUM_TIPOS_HAMBURGUESA 6
+
+/** @brief Umbral para considerar inventario bajo */
 #define UMBRAL_INVENTARIO_BAJO 2
 
-// Mismas estructuras que el sistema principal
+/** @} */
+
+/**
+ * @defgroup estructuras_panel Estructuras de Datos del Panel de Control
+ * @{
+ *
+ * IMPORTANTE: Estas estructuras deben ser IDÉNTICAS a las del sistema principal
+ * para garantizar la correcta interpretación de la memoria compartida.
+ * Cualquier cambio en el sistema principal debe reflejarse aquí.
+ */
+
+/**
+ * @brief Estructura que representa un ingrediente en el inventario
+ *
+ * Mantiene la misma estructura que el sistema principal para compatibilidad
+ * en memoria compartida.
+ */
 typedef struct
 {
+    /** @brief Nombre del ingrediente */
     char nombre[MAX_NOMBRE_INGREDIENTE];
+
+    /** @brief Cantidad disponible en el dispensador */
     int cantidad;
+
+    /** @brief Mutex para acceso thread-safe al inventario */
     pthread_mutex_t mutex;
 } Ingrediente;
 
+/**
+ * @brief Estructura que define un tipo de hamburguesa disponible
+ *
+ * Contiene la receta completa y precio de cada tipo de hamburguesa.
+ * Debe coincidir exactamente con la estructura del sistema principal.
+ */
 typedef struct
 {
+    /** @brief Nombre comercial de la hamburguesa */
     char nombre[50];
+
+    /** @brief Lista de ingredientes requeridos para la receta */
     char ingredientes[10][MAX_NOMBRE_INGREDIENTE];
+
+    /** @brief Número total de ingredientes en la receta */
     int num_ingredientes;
+
+    /** @brief Precio de venta de la hamburguesa */
     float precio;
 } TipoHamburguesa;
 
+/**
+ * @brief Estructura para entradas de log del sistema
+ *
+ * Mantiene un historial de eventos y actividades de cada banda.
+ * Incluye timestamp y clasificación de alertas.
+ */
 typedef struct
 {
+    /** @brief Mensaje descriptivo del evento */
     char mensaje[100];
+
+    /** @brief Timestamp Unix del momento del evento */
     time_t timestamp;
+
+    /** @brief Flag que indica si es una alerta crítica */
     int es_alerta;
 } LogEntry;
 
+/**
+ * @brief Estructura que representa una orden de hamburguesa
+ *
+ * Contiene toda la información necesaria para procesar una orden,
+ * incluyendo estado de procesamiento y metadatos de seguimiento.
+ */
 typedef struct
 {
+    /** @brief Identificador único de la orden */
     int id_orden;
+
+    /** @brief Índice del tipo de hamburguesa en el menú */
     int tipo_hamburguesa;
+
+    /** @brief Nombre de la hamburguesa solicitada */
     char nombre_hamburguesa[50];
+
+    /** @brief Lista de ingredientes específicos para esta orden */
     char ingredientes_solicitados[MAX_INGREDIENTES][MAX_NOMBRE_INGREDIENTE];
+
+    /** @brief Número total de ingredientes en la orden */
     int num_ingredientes;
+
+    /** @brief Timestamp de creación de la orden */
     time_t tiempo_creacion;
+
+    /** @brief Paso actual en el proceso de preparación */
     int paso_actual;
+
+    /** @brief Flag que indica si la orden está completada */
     int completada;
+
+    /** @brief ID de la banda asignada para procesar la orden */
     int asignada_a_banda;
+
+    /** @brief Contador de intentos de asignación a bandas */
     int intentos_asignacion;
 } Orden;
 
+/**
+ * @brief Estructura que representa una banda de preparación
+ *
+ * Contiene el estado completo de una banda, incluyendo su inventario,
+ * logs de actividad y mecanismos de control. Debe coincidir exactamente
+ * con la estructura del sistema principal.
+ */
 typedef struct
 {
+    /** @brief Identificador único de la banda */
     int id;
+
+    /** @brief Flag que indica si la banda está operativa */
     int activa;
+
+    /** @brief Flag que indica si la banda está pausada */
     int pausada;
+
+    /** @brief Contador total de hamburguesas procesadas */
     int hamburguesas_procesadas;
+
+    /** @brief Flag que indica si está procesando una orden */
     int procesando_orden;
+
+    /** @brief Orden que está siendo procesada actualmente */
     Orden orden_actual;
+
+    /** @brief Array de dispensadores de ingredientes de la banda */
     Ingrediente dispensadores[MAX_INGREDIENTES];
+
+    /** @brief Historial de logs de actividades de la banda */
     LogEntry logs[MAX_LOGS_POR_BANDA];
+
+    /** @brief Número actual de entradas de log */
     int num_logs;
+
+    /** @brief Hilo POSIX que ejecuta la lógica de la banda */
     pthread_t hilo;
+
+    /** @brief Mutex para acceso exclusivo a los datos de la banda */
     pthread_mutex_t mutex;
+
+    /** @brief Variable de condición para sincronización */
     pthread_cond_t condicion;
+
+    /** @brief Descripción del estado actual de la banda */
     char estado_actual[100];
+
+    /** @brief Nombre del ingrediente que se está procesando */
     char ingrediente_actual[50];
+
+    /** @brief Flag que indica si necesita reabastecimiento */
     int necesita_reabastecimiento;
+
+    /** @brief Timestamp de la última alerta de inventario */
     time_t ultima_alerta_inventario;
 } Banda;
 
+/**
+ * @brief Estructura que implementa la cola FIFO de órdenes
+ *
+ * Gestiona las órdenes pendientes de asignación a bandas.
+ * Implementa una cola circular thread-safe con sincronización completa.
+ */
 typedef struct
 {
+    /** @brief Array circular que almacena las órdenes */
     Orden ordenes[MAX_ORDENES];
+
+    /** @brief Índice del primer elemento en la cola */
     int frente;
+
+    /** @brief Índice de la siguiente posición libre */
     int atras;
+
+    /** @brief Número actual de órdenes en la cola */
     int tamano;
+
+    /** @brief Mutex para acceso exclusivo a la cola */
     pthread_mutex_t mutex;
+
+    /** @brief Variable de condición para cola no vacía */
     pthread_cond_t no_vacia;
+
+    /** @brief Variable de condición para cola no llena */
     pthread_cond_t no_llena;
 } ColaFIFO;
 
+/**
+ * @brief Estructura principal de datos compartidos del sistema
+ *
+ * Contiene toda la información del sistema que se comparte entre
+ * el sistema principal y el panel de control a través de memoria compartida.
+ */
 typedef struct
 {
+    /** @brief Array de todas las bandas del sistema */
     Banda bandas[MAX_BANDAS];
+
+    /** @brief Cola FIFO de órdenes pendientes */
     ColaFIFO cola_espera;
+
+    /** @brief Número actual de bandas activas */
     int num_bandas;
+
+    /** @brief Flag que indica si el sistema está operativo */
     int sistema_activo;
+
+    /** @brief Contador total de órdenes procesadas */
     int total_ordenes_procesadas;
+
+    /** @brief Contador total de órdenes generadas */
     int total_ordenes_generadas;
+
+    /** @brief Mutex global para operaciones del sistema */
     pthread_mutex_t mutex_global;
+
+    /** @brief Variable de condición para nuevas órdenes */
     pthread_cond_t nueva_orden;
 } DatosCompartidos;
 
-// Variables globales
+/**
+ * @defgroup variables_globales Variables Globales del Panel de Control
+ * @{
+ */
+
+/** @brief Puntero a la estructura de datos compartidos del sistema principal */
 DatosCompartidos *datos_compartidos;
+
+/** @brief Ventana principal que muestra la vista general del sistema */
 WINDOW *win_main;
+
+/** @brief Ventana que muestra detalles de banda o inventario */
 WINDOW *win_banda_detail;
+
+/** @brief Ventana que muestra los comandos disponibles según el modo actual */
 WINDOW *win_commands;
+
+/** @brief Ventana que muestra el estado del sistema y la vista actual */
 WINDOW *win_status;
+
+/** @brief Índice de la banda actualmente seleccionada (0 a num_bandas-1) */
 int banda_seleccionada = 0;
+
+/** @brief Índice del ingrediente seleccionado en modo inventario (0 a MAX_INGREDIENTES-1) */
 int ingrediente_seleccionado = 0;
-int modo_vista = 0; // 0=general, 1=detalle banda, 2=inventario global, 3=inventario banda, 4=abastecimiento
+
+/** @brief Modo de vista actual del panel de control
+ *
+ * Valores posibles:
+ * - 0: Vista general (resumen de todas las bandas)
+ * - 1: Detalle de banda específica
+ * - 2: Inventario global (resumen por ingrediente)
+ * - 3: Inventario de banda específica (editable)
+ * - 4: Modo abastecimiento (operaciones masivas)
+ */
+int modo_vista = 0;
+
+/** @brief Flag que indica si el panel está en modo abastecimiento */
 int en_modo_abastecimiento = 0;
 
-// Menu de hamburguesas
+/** @} */
+
+/**
+ * @defgroup datos_estaticos Datos Estáticos del Sistema
+ * @{
+ */
+
+/**
+ * @brief Menú completo de hamburguesas disponibles
+ *
+ * Define todos los tipos de hamburguesas que se pueden preparar en el sistema,
+ * incluyendo sus ingredientes específicos, cantidad de ingredientes y precios.
+ * Cada hamburguesa tiene una receta única que determina el orden de preparación.
+ *
+ * @note Debe coincidir exactamente con el menú del sistema principal
+ */
 TipoHamburguesa menu_hamburguesas[NUM_TIPOS_HAMBURGUESA] = {
+    /** @brief Hamburguesa Clásica: Pan, carne, lechuga, tomate */
     {"Clasica", {"pan_inferior", "carne", "lechuga", "tomate", "pan_superior"}, 5, 8.50},
+
+    /** @brief Cheeseburger: Clásica + queso */
     {"Cheeseburger", {"pan_inferior", "carne", "queso", "lechuga", "tomate", "pan_superior"}, 6, 9.25},
+
+    /** @brief BBQ Bacon: Con bacon, queso, cebolla y salsa BBQ */
     {"BBQ Bacon", {"pan_inferior", "carne", "bacon", "queso", "cebolla", "salsa_bbq", "pan_superior"}, 7, 11.75},
+
+    /** @brief Vegetariana: Sin carne, con vegetal y aguacate */
     {"Vegetariana", {"pan_inferior", "vegetal", "lechuga", "tomate", "aguacate", "mayonesa", "pan_superior"}, 7, 10.25},
+
+    /** @brief Deluxe: Hamburguesa premium con todos los ingredientes */
     {"Deluxe", {"pan_inferior", "carne", "queso", "bacon", "lechuga", "tomate", "cebolla", "mayonesa", "pan_superior"}, 9, 13.50},
+
+    /** @brief Spicy Mexican: Con jalapeños y salsa picante */
     {"Spicy Mexican", {"pan_inferior", "carne", "queso", "jalapenos", "tomate", "cebolla", "salsa_picante", "pan_superior"}, 8, 12.00}};
 
-// Ingredientes base
+/**
+ * @brief Lista completa de ingredientes base disponibles
+ *
+ * Define todos los ingredientes que pueden estar presentes en cualquier
+ * hamburguesa del sistema. Cada banda tiene dispensadores para todos estos
+ * ingredientes, permitiendo preparar cualquier tipo de hamburguesa del menú.
+ *
+ * @note Debe coincidir exactamente con la lista del sistema principal
+ */
 char ingredientes_base[MAX_INGREDIENTES][MAX_NOMBRE_INGREDIENTE] = {
     "pan_inferior", "pan_superior", "carne", "queso", "tomate",
     "lechuga", "cebolla", "bacon", "mayonesa", "jalapenos",
     "aguacate", "vegetal", "salsa_bbq", "salsa_picante", "pepinillos"};
 
-// Prototipos
+/** @} */
+
+/**
+ * @defgroup prototipos_panel Prototipos de Funciones del Panel de Control
+ * @{
+ *
+ * Declaraciones de todas las funciones del panel de control, organizadas
+ * por categorías funcionales para facilitar la comprensión del código.
+ */
+
+// ============================================================================
+// FUNCIONES DE INICIALIZACIÓN Y CONFIGURACIÓN
+// ============================================================================
+
+/**
+ * @brief Inicializa la biblioteca ncurses y configura la interfaz gráfica
+ * @note Configura colores, ventanas y parámetros de la terminal
+ */
 void inicializar_ncurses();
+
+/**
+ * @brief Conecta el panel con el sistema principal a través de memoria compartida
+ * @warning Si no puede conectar, el programa termina con mensaje de error
+ */
 void conectar_memoria_compartida();
+
+// ============================================================================
+// FUNCIONES DE VISUALIZACIÓN PRINCIPAL
+// ============================================================================
+
+/**
+ * @brief Muestra la vista general del sistema con resumen de todas las bandas
+ * @note Incluye estadísticas generales y estado de cada banda
+ */
 void mostrar_interfaz_general();
+
+/**
+ * @brief Muestra información detallada de la banda seleccionada
+ * @note Incluye estado, orden actual, inventario crítico y logs
+ */
 void mostrar_detalle_banda();
+
+/**
+ * @brief Muestra resumen global del inventario por ingrediente
+ * @note Agrupa información de todas las bandas por tipo de ingrediente
+ */
 void mostrar_inventario_global();
+
+/**
+ * @brief Muestra inventario completo de la banda seleccionada
+ * @note Permite edición interactiva de cantidades de ingredientes
+ */
 void mostrar_inventario_banda();
+
+/**
+ * @brief Muestra el modo de abastecimiento con opciones masivas
+ * @note Incluye opciones para reabastecer bandas específicas o todas
+ */
 void mostrar_modo_abastecimiento();
+
+/**
+ * @brief Muestra los comandos disponibles según el modo de vista actual
+ * @note Se actualiza dinámicamente según el contexto del usuario
+ */
 void mostrar_comandos_disponibles();
+
+// ============================================================================
+// FUNCIONES DE CONTROL Y PROCESAMIENTO
+// ============================================================================
+
+/**
+ * @brief Procesa un comando de teclado del usuario
+ * @param ch Código del carácter o tecla especial presionada
+ * @note Maneja navegación, control de bandas y operaciones de inventario
+ */
 void procesar_comando(int ch);
+
+/**
+ * @brief Pausa o reanuda una banda específica
+ * @param banda_id ID de la banda a pausar/reanudar
+ * @note Cambia el estado de la banda y muestra mensaje de confirmación
+ */
 void pausar_reanudar_banda(int banda_id);
+
+/**
+ * @brief Reabastece completamente el inventario de una banda
+ * @param banda_id ID de la banda a reabastecer
+ * @note Llena todos los dispensadores a capacidad máxima
+ */
 void reabastecer_banda_completa(int banda_id);
+
+/**
+ * @brief Reabastece un ingrediente específico de una banda
+ * @param banda_id ID de la banda
+ * @param ingrediente_id ID del ingrediente a reabastecer
+ * @note Llena solo el ingrediente especificado
+ */
 void reabastecer_ingrediente_especifico(int banda_id, int ingrediente_id);
+
+// ============================================================================
+// FUNCIONES DE NAVEGACIÓN Y SELECCIÓN
+// ============================================================================
+
+/**
+ * @brief Cambia la banda seleccionada en la dirección especificada
+ * @param direccion +1 para siguiente banda, -1 para anterior
+ * @note Implementa navegación circular entre bandas
+ */
 void cambiar_banda_seleccionada(int direccion);
+
+/**
+ * @brief Cambia el ingrediente seleccionado en modo inventario
+ * @param direccion +1 para siguiente ingrediente, -1 para anterior
+ * @note Implementa navegación circular entre ingredientes
+ */
 void cambiar_ingrediente_seleccionado(int direccion);
+
+// ============================================================================
+// FUNCIONES DE UTILIDAD Y AYUDA
+// ============================================================================
+
+/**
+ * @brief Muestra un mensaje temporal en la parte inferior de la pantalla
+ * @param mensaje Texto del mensaje a mostrar
+ * @note El mensaje se muestra por 1.5 segundos y luego se borra
+ */
 void mostrar_mensaje_temporal(const char *mensaje);
+
+/**
+ * @brief Muestra la ayuda detallada del panel de control
+ * @note Incluye todos los controles disponibles y ejemplos de uso
+ */
 void mostrar_ayuda_detallada();
+
+/**
+ * @brief Limpia todos los recursos de ncurses y restaura la terminal
+ * @note Debe ser llamada antes de terminar el programa
+ */
 void limpiar_ncurses();
+
+/**
+ * @brief Determina el color apropiado para mostrar un ingrediente según su cantidad
+ * @param cantidad Cantidad actual del ingrediente
+ * @return Cadena con el código de color apropiado
+ * @note Verde para normal, amarillo para crítico, rojo para agotado
+ */
 const char *obtener_color_ingrediente(int cantidad);
+
+/**
+ * @brief Muestra el menú de opciones de abastecimiento
+ * @note Función auxiliar para mostrar_modo_abastecimiento()
+ */
 void mostrar_menu_abastecimiento();
+
+/** @} */
 
 // ================================================================
 // INICIALIZACION Y CONFIGURACION
@@ -1333,6 +1782,7 @@ int main()
 
     printf("\nPanel de control terminado correctamente\n");
     printf("Estadísticas finales:\n");
+    // Mostrar estadísticas finales del sistema
     printf("   * Órdenes procesadas: %d\n", datos_compartidos->total_ordenes_procesadas);
     printf("   * Órdenes en cola: %d\n", datos_compartidos->cola_espera.tamano);
     printf("   * Bandas monitoreadas: %d\n", datos_compartidos->num_bandas);
@@ -1340,3 +1790,25 @@ int main()
 
     return 0;
 }
+
+/**
+ * @}
+ *
+ * @page conclusiones_panel Conclusiones del Panel de Control
+ *
+ * Este panel de control demuestra las siguientes características técnicas:
+ *
+ * - **INTERFAZ GRÁFICA AVANZADA**: Utiliza ncurses para interfaz profesional en terminal
+ * - **COMUNICACIÓN EN TIEMPO REAL**: Conexión directa con el sistema principal
+ * - **MÚLTIPLES VISTAS**: Diferentes modos de visualización según necesidades
+ * - **CONTROL INTERACTIVO**: Operaciones directas sobre bandas e inventario
+ * - **NAVEGACIÓN INTUITIVA**: Controles de teclado consistentes y fáciles de usar
+ * - **GESTIÓN DE RECURSOS**: Manejo eficiente de memoria y sincronización
+ *
+ * El panel está diseñado para ser robusto, eficiente y fácil de usar,
+ * proporcionando control total sobre el sistema de hamburguesas.
+ *
+ * @author [Tu Nombre]
+ * @date [Fecha de Finalización]
+ * @version 1.0
+ */
